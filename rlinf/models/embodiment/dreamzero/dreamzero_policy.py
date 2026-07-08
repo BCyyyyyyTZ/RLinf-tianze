@@ -23,12 +23,11 @@ from groot.vla.model.dreamzero.base_vla import VLA, VLAConfig
 from tianshou.data import Batch
 from transformers.configuration_utils import PretrainedConfig
 
-from rlinf.algorithms.dreamzero import set_dreamzero_loss_payload
 from rlinf.data.datasets.dreamzero.data_transforms import (
     DreamZeroObservationTransform,
 )
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
-from rlinf.models.embodiment.dreamzero.world_model import DreamZeroWorldModel
+from rlinf.models.embodiment.dreamzero.ppo_policy import DreamZeroPPOPolicyMixin
 from rlinf.utils.logging import get_logger
 
 
@@ -71,6 +70,13 @@ class DreamZeroConfig(VLAConfig):
     )
 
     gradient_checkpointing: bool = False
+    add_value_head: bool = False
+    noise_method: str = "flow_sde"
+    noise_level: float = 0.5
+    safe_get_logprob: bool = False
+    joint_logprob: bool = False
+    num_steps: int = 10
+    ppo_deterministic_eval: bool = True
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -78,7 +84,7 @@ class DreamZeroConfig(VLAConfig):
             setattr(self, key, value)
 
 
-class DreamZeroPolicy(VLA, BasePolicy):
+class DreamZeroPolicy(DreamZeroPPOPolicyMixin, VLA, BasePolicy):
     """Lightweight DreamZero action model: IdentityBackbone + WANPolicyHead."""
 
     _no_split_modules = [
@@ -105,10 +111,11 @@ class DreamZeroPolicy(VLA, BasePolicy):
                     diffusion_model.gradient_checkpointing = enabled
         except Exception:
             pass
-        self.world_model: DreamZeroWorldModel | None = None
         self.observation_transform: DreamZeroObservationTransform | None = getattr(
             config, "observation_transform", None
         )
+        if bool(getattr(config, "add_value_head", False)):
+            self._setup_ppo_heads(value_input_dim=int(getattr(config, "action_dim", 32)))
 
     def apply(self, batch: Batch, **kwargs) -> Batch:
         """Normalize inputs"""
@@ -318,126 +325,66 @@ class DreamZeroPolicy(VLA, BasePolicy):
             )
         return actions
 
-    def _flatten_rl_tensor_payload(
-        self, normalized_input: dict[str, Any]
-    ) -> dict[str, torch.Tensor]:
-        flat: dict[str, torch.Tensor] = {}
-        for key, value in normalized_input.items():
-            if value is None:
-                continue
-            tensor = self._to_tensor(value)
-            flat[f"dreamzero_rl.{key}"] = tensor.detach().cpu().contiguous()
-        return flat
+    def _action_obs_to_device(self, action_obs: dict[str, Any]) -> dict[str, Any]:
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
 
-    @staticmethod
-    def _expand_video_for_action_head(
-        images: torch.Tensor, actions: torch.Tensor
+        def move(value: Any) -> Any:
+            if torch.is_tensor(value):
+                value = value.to(device=device)
+                if value.dtype == torch.float32 and dtype != torch.float32:
+                    value = value.to(dtype=dtype)
+                return value
+            if isinstance(value, dict):
+                return {key: move(child) for key, child in value.items()}
+            return value
+
+        return {key: move(value) for key, value in action_obs.items()}
+
+    def _sample_initial_action_noise(
+        self, batch_size: int, *, device: torch.device
     ) -> torch.Tensor:
-        if images.ndim < 5:
-            return images
-        action_steps = actions.shape[-2] if actions.ndim >= 3 else 0
-        if action_steps <= 0:
-            return images
-        num_action_per_block = 24
-        num_frame_per_block = 2
-        blocks = max(1, action_steps // num_action_per_block)
-        target_frames = blocks * num_frame_per_block * 4 + 1
-        if images.shape[1] == target_frames:
-            return images
-        if images.shape[1] > target_frames:
-            return images[:, -target_frames:]
-        repeat_shape = (images.shape[0], target_frames - images.shape[1], *images.shape[2:])
-        pad = images[:, :1].expand(repeat_shape)
-        return torch.cat([pad, images], dim=1)
+        return torch.randn(
+            batch_size,
+            int(self.config.action_horizon),
+            int(self.config.action_dim),
+            device=device,
+            dtype=torch.float32,
+        )
 
-    def _normalize_forward_payload_for_rollout(
-        self, forward_inputs: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        images = forward_inputs.get("dreamzero_rl.images")
-        actions = forward_inputs.get("dreamzero_rl.action")
-        if torch.is_tensor(images) and torch.is_tensor(actions):
-            forward_inputs = dict(forward_inputs)
-            forward_inputs["dreamzero_rl.images"] = (
-                self._expand_video_for_action_head(images, actions)
-                .detach()
-                .cpu()
-                .contiguous()
-            )
-        return forward_inputs
-
-    @staticmethod
-    def _dreamzero_action_logprob_std(default: float = 0.02) -> float:
-        raw = os.getenv("DREAMZERO_ACTION_LOGPROB_STD", str(default))
-        std = float(raw)
-        if std <= 0:
-            raise ValueError("DREAMZERO_ACTION_LOGPROB_STD must be positive.")
-        return std
-
-    @staticmethod
-    def _gaussian_action_logprob(
-        action: torch.Tensor,
-        mean: torch.Tensor,
-        *,
-        std: float,
-        mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        action = action.to(device=mean.device, dtype=torch.float32)
-        mean = mean.float()
-        if action.shape != mean.shape:
-            action = action.reshape_as(mean)
-        var = std * std
-        log_scale = float(np.log(std))
-        log_two_pi = float(np.log(2.0 * np.pi))
-        logprob = -0.5 * ((action - mean).pow(2) / var + 2.0 * log_scale + log_two_pi)
-        if mask is not None:
-            mask = mask.to(device=logprob.device, dtype=torch.bool)
-            if mask.shape != logprob.shape:
-                mask = mask.reshape_as(logprob)
-            logprob = torch.where(mask, logprob, torch.zeros_like(logprob))
-        return logprob.reshape(logprob.shape[0], -1).sum(dim=-1)
-
-    def _build_action_chain_payload(
+    def _predict_action_velocity(
         self,
-        *,
-        normalized_action: torch.Tensor,
-        mean_action: torch.Tensor,
-        action_mask: torch.Tensor | None,
-    ) -> dict[str, torch.Tensor]:
-        std = self._dreamzero_action_logprob_std()
-        old_logprob = self._gaussian_action_logprob(
-            normalized_action,
-            mean_action,
-            std=std,
-            mask=action_mask,
-        )
-        timesteps = torch.zeros(
-            normalized_action.shape[0], 1, dtype=torch.long, device=normalized_action.device
-        )
-        return {
-            "dreamzero_action_chain": torch.stack(
-                [mean_action.detach(), normalized_action.detach()], dim=1
-            )
-            .cpu()
-            .contiguous(),
-            "dreamzero_action_timesteps": timesteps.detach().cpu().contiguous(),
-            "dreamzero_old_action_logprob": old_logprob.detach().cpu().contiguous(),
-            "dreamzero_action_logprob_std": torch.full(
-                (normalized_action.shape[0],),
-                std,
-                dtype=torch.float32,
-                device=normalized_action.device,
-            )
-            .cpu()
-            .contiguous(),
-        }
+        action_obs: dict[str, Any],
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        action_head = getattr(self, "action_head", None)
+        if action_head is not None and hasattr(action_head, "predict_action_velocity_only"):
+            output = action_head.predict_action_velocity_only(action_obs, x_t, timestep)
+            if isinstance(output, dict):
+                velocity = output["velocity"]
+                value_feature = output.get("value_feature", velocity.float().mean(dim=1))
+                return velocity.float(), value_feature.float()
+            return output.float(), output.float().mean(dim=1)
 
-    @staticmethod
-    def _restore_rl_tensor_payload(forward_inputs: dict[str, Any]) -> dict[str, Any]:
-        return {
-            key.removeprefix("dreamzero_rl."): value
-            for key, value in forward_inputs.items()
-            if key.startswith("dreamzero_rl.")
-        }
+        self._reset_action_chain_inference_state()
+        obs = dict(action_obs)
+        obs["action"] = x_t.to(
+            device=next(self.parameters()).device, dtype=next(self.parameters()).dtype
+        )
+        obs["has_real_action"] = torch.ones(
+            x_t.shape[0],
+            device=x_t.device,
+            dtype=torch.bool,
+        )
+        pred = self.lazy_joint_video_action_causal(obs, return_video=False)["action_pred"]
+        pred = pred.to(device=x_t.device, dtype=torch.float32)
+        timestep = timestep.to(device=x_t.device, dtype=torch.float32)
+        if timestep.ndim == 1:
+            timestep = timestep[:, None, None]
+        timestep = timestep.clamp_min(1e-4)
+        velocity = (x_t.float() - pred) / timestep
+        return velocity, pred.float().mean(dim=1)
 
     def _reset_action_chain_inference_state(self) -> None:
         action_head = getattr(self, "action_head", None)
@@ -535,6 +482,20 @@ class DreamZeroPolicy(VLA, BasePolicy):
             actions = actions[:, :num_action_chunks, :]
         return actions
 
+    def _actions_from_unapply(self, act: dict[str, Any]) -> np.ndarray:
+        action_keys = getattr(self, "_action_keys", None)
+        if action_keys:
+            values = [act[key] for key in action_keys if key in act]
+            if values:
+                if any(torch.is_tensor(value) for value in values):
+                    tensors = [
+                        value if torch.is_tensor(value) else torch.as_tensor(value)
+                        for value in values
+                    ]
+                    return torch.cat(tensors, dim=-1).detach().cpu().numpy()
+                return np.concatenate(values, axis=-1)
+        return self._extract_env_actions(act)
+
     def _observation_convert(self, env_obs: dict) -> dict:
         """Convert environment observation to DreamZero model input."""
         if self.observation_transform is None:
@@ -563,12 +524,25 @@ class DreamZeroPolicy(VLA, BasePolicy):
 
         converted_obs = self._observation_convert(env_obs)
         batch = Batch(obs=converted_obs)
-        # ---------- DreamZero inference ----------
         normalized_input = self._process_batch(batch)
         with torch.no_grad():
-            model_pred = self.lazy_joint_video_action_causal(normalized_input)
+            action_obs = self._prepare_action_only_obs(normalized_input)
+            batch_size = next(
+                value.shape[0]
+                for value in action_obs.values()
+                if torch.is_tensor(value)
+            )
+            initial_noise = self._sample_initial_action_noise(
+                batch_size, device=next(self.parameters()).device
+            )
+            chains, denoise_inds, prev_logprobs, prev_values = self._sample_action_chain(
+                action_obs=action_obs,
+                initial_noise=initial_noise,
+                mode=mode,
+                compute_values=bool(getattr(self.config, "add_value_head", False)),
+            )
 
-        normalized_action = model_pred["action_pred"].float()
+        normalized_action = chains[:, -1].float()
 
         # Unnormalize actions (pass obs for relative action normalization)
         unnormalized_action = self.config.data_transforms.unapply(
@@ -589,37 +563,22 @@ class DreamZeroPolicy(VLA, BasePolicy):
         )
 
         env_action_tensor = torch.as_tensor(actions, dtype=torch.float32).cpu()
-        flat_env_action = env_action_tensor.reshape(actions.shape[0], -1)
         real_action_dim = self._infer_real_action_dim(
             min(normalized_action.shape[-1], actions.shape[-1] + 1)
         )
         action_mask = torch.zeros_like(normalized_action, dtype=torch.bool)
         action_mask[..., :real_action_dim] = True
-        action_chain_payload = self._build_action_chain_payload(
-            normalized_action=normalized_action.cpu(),
-            mean_action=normalized_action.detach().cpu(),
+        forward_inputs = self._build_ppo_forward_inputs(
+            action_obs=action_obs,
+            chains=chains.cpu(),
+            denoise_inds=denoise_inds.cpu(),
             action_mask=action_mask.cpu(),
+            model_action=normalized_action.cpu().contiguous(),
+            env_action=env_action_tensor.cpu().contiguous(),
         )
-        rl_input = dict(normalized_input)
-        rl_input["action"] = normalized_action.cpu()
-        rl_input["action_mask"] = action_mask.cpu()
-        rl_input["has_real_action"] = torch.ones(
-            normalized_action.shape[0], dtype=torch.bool
-        )
-        forward_inputs = {
-            "action": flat_env_action,
-            "model_action": normalized_action.cpu()
-            .reshape(normalized_action.shape[0], -1)
-            .contiguous(),
-        }
-        forward_inputs.update(self._flatten_rl_tensor_payload(rl_input))
-        forward_inputs.update(action_chain_payload)
-        forward_inputs = self._normalize_forward_payload_for_rollout(forward_inputs)
         result = {
-            "prev_logprobs": action_chain_payload[
-                "dreamzero_old_action_logprob"
-            ].to(dtype=torch.float32),
-            "prev_values": torch.zeros((flat_env_action.shape[0], 1), dtype=torch.float32),
+            "prev_logprobs": prev_logprobs.detach().cpu().to(dtype=torch.float32),
+            "prev_values": prev_values.detach().cpu().to(dtype=torch.float32),
             "forward_inputs": forward_inputs,
         }
         return actions, result
@@ -650,329 +609,9 @@ class DreamZeroPolicy(VLA, BasePolicy):
         """Default forward pass."""
         if forward_inputs is None:
             raise ValueError("DreamZero default_forward requires `forward_inputs`.")
-        if any(key.startswith("dreamzero_rl.") for key in forward_inputs):
-            return self.rl_forward(forward_inputs=forward_inputs, **kwargs)
-
-        world_inputs = self._prepare_world_model_inputs(forward_inputs)
-        world_model = self._get_world_model(
-            obs_dim=world_inputs["curr_obs"]["states"].shape[-1],
-            action_dim=world_inputs["actions"].shape[-1],
+        if "dreamzero_ppo.action_obs" in forward_inputs:
+            return self.ppo_forward(forward_inputs=forward_inputs, **kwargs)
+        raise KeyError(
+            "DreamZero default_forward only supports OpenPI-style PPO inputs "
+            "('dreamzero_ppo.action_obs')."
         )
-        outputs = world_model(**world_inputs)
-        set_dreamzero_loss_payload(outputs["losses"], outputs["metrics"])
-
-        actions = world_inputs["actions"]
-        logprobs = torch.zeros_like(actions, dtype=torch.float32)
-        result: dict[str, Any] = {
-            "logprobs": logprobs,
-            "dreamzero_losses": outputs["losses"],
-            "dreamzero_metrics": outputs["metrics"],
-            "dreamzero_outputs": outputs,
-        }
-        if kwargs.get("compute_entropy", False):
-            result["entropy"] = torch.zeros_like(actions, dtype=torch.float32)
-        if kwargs.get("compute_values", False):
-            values = world_model.value_model(outputs["posterior_features"].detach())
-            result["values"] = values
-        return result
-
-    def rl_forward(
-        self,
-        forward_inputs: dict[str, Any],
-        **kwargs,
-    ) -> dict[str, Any]:
-        rl_input = self._restore_rl_tensor_payload(forward_inputs)
-        if not rl_input:
-            raise KeyError(
-                "DreamZero RL forward requires tensor payload keys prefixed with "
-                "'dreamzero_rl.'."
-            )
-
-        actions = rl_input.get("action")
-        if actions is None:
-            actions = forward_inputs.get("model_action")
-        if actions is None:
-            raise KeyError(
-                "DreamZero RL forward requires normalized sampled actions under "
-                "'dreamzero_rl.action' or 'model_action'."
-            )
-        actions = self._ensure_batch_time(actions, "actions")
-        if actions.ndim > 3:
-            actions = actions.reshape(actions.shape[0], -1, actions.shape[-1])
-        if actions.is_floating_point():
-            actions = torch.nan_to_num(actions, nan=0.0, posinf=1.0, neginf=-1.0)
-            actions = actions.clamp(-1.0, 1.0)
-        rl_input["action"] = actions
-        images = rl_input.get("images")
-        if torch.is_tensor(images) and images.ndim >= 5 and images.shape[1] == 1:
-            diffusion_model = getattr(getattr(self, "action_head", None), "model", None)
-            num_action_per_block = int(
-                getattr(diffusion_model, "num_action_per_block", actions.shape[1])
-            )
-            num_frame_per_block = int(
-                getattr(getattr(self, "action_head", None), "num_frame_per_block", 1)
-            )
-            blocks = max(1, actions.shape[1] // max(1, num_action_per_block))
-            target_frames = blocks * max(1, num_frame_per_block) * 4 + 1
-            rl_input["images"] = images.expand(
-                images.shape[0], target_frames, *images.shape[2:]
-            ).contiguous()
-
-        logprob_mode = kwargs.get("dreamzero_logprob_mode", "action_chain")
-        use_action_chain_logprob = (
-            logprob_mode == "action_chain"
-            and "dreamzero_old_action_logprob" in forward_inputs
-        )
-
-        action_logprobs = None
-        extra_metrics: dict[str, torch.Tensor] = {}
-        if use_action_chain_logprob:
-            self._reset_action_chain_inference_state()
-            mean_pred = self.lazy_joint_video_action_causal(
-                rl_input, return_video=False
-            )["action_pred"]
-            action_logprob_std = forward_inputs.get("dreamzero_action_logprob_std", None)
-            if torch.is_tensor(action_logprob_std):
-                std = float(action_logprob_std.float().reshape(-1)[0].item())
-            else:
-                std = self._dreamzero_action_logprob_std()
-            action_logprobs = self._gaussian_action_logprob(
-                actions,
-                mean_pred.to(device=actions.device),
-                std=std,
-                mask=rl_input.get("action_mask"),
-            )
-            action_loss = action_logprobs.detach().new_zeros(action_logprobs.shape)
-        else:
-            action_losses = []
-            for index in range(actions.shape[0]):
-                sample_input = self._slice_rl_sample(rl_input, index)
-                outputs = VLA.forward(self, sample_input)
-                if "action_loss" not in outputs:
-                    raise KeyError(
-                        "DreamZero action-head forward did not return 'action_loss'; "
-                        "cannot compute a real RL update."
-                    )
-                action_losses.append(outputs["action_loss"].reshape(()))
-                if index == 0:
-                    if "dynamics_loss" in outputs:
-                        extra_metrics["dreamzero/dynamics_loss"] = outputs[
-                            "dynamics_loss"
-                        ].detach()
-                    if "loss" in outputs:
-                        extra_metrics["dreamzero/base_loss"] = outputs["loss"].detach()
-
-            action_loss = torch.stack(action_losses)
-
-        losses = {"action_loss": action_loss}
-        if action_logprobs is not None:
-            losses["action_logprobs"] = action_logprobs
-            old_action_logprobs = forward_inputs["dreamzero_old_action_logprob"].to(
-                device=actions.device, dtype=torch.float32
-            )
-            losses["old_action_logprobs"] = old_action_logprobs.reshape_as(
-                action_logprobs
-            )
-        metrics = {
-            "dreamzero/raw_action_loss": action_loss.detach().mean(),
-            "dreamzero/rl_batch_size": torch.tensor(
-                actions.shape[0], device=actions.device, dtype=torch.float32
-            ),
-        }
-        if action_logprobs is not None:
-            metrics["dreamzero/action_chain_logprob_forward"] = (
-                action_logprobs.detach().mean()
-            )
-        metrics.update(extra_metrics)
-        set_dreamzero_loss_payload(losses, metrics)
-
-        if action_logprobs is None:
-            flat_logprobs = torch.zeros(
-                actions.shape[0],
-                actions.shape[1] * actions.shape[2],
-                dtype=torch.float32,
-                device=actions.device,
-            )
-        else:
-            flat_logprobs = action_logprobs.float()
-        result: dict[str, Any] = {
-            "logprobs": flat_logprobs,
-            "dreamzero_losses": losses,
-            "dreamzero_metrics": metrics,
-        }
-        if kwargs.get("compute_entropy", False):
-            result["entropy"] = torch.zeros_like(flat_logprobs)
-        return result
-
-    @staticmethod
-    def _slice_rl_sample(inputs: dict[str, Any], index: int) -> dict[str, Any]:
-        sample: dict[str, Any] = {}
-        for key, value in inputs.items():
-            if torch.is_tensor(value):
-                sample[key] = value[index : index + 1].contiguous()
-            else:
-                sample[key] = value
-        return sample
-
-    def _get_world_model(self, obs_dim: int, action_dim: int) -> DreamZeroWorldModel:
-        if self.world_model is not None:
-            return self.world_model
-
-        cfg = self.config
-        self.world_model = DreamZeroWorldModel(
-            obs_dim=obs_dim,
-            action_dim=action_dim,
-            stochastic_dim=getattr(cfg, "rssm_stochastic_dim", 32),
-            deterministic_dim=getattr(cfg, "rssm_deterministic_dim", 128),
-            hidden_dim=getattr(cfg, "world_model_hidden_dim", 256),
-            imagination_horizon=getattr(cfg, "imagination_horizon", 15),
-            gamma=getattr(cfg, "gamma", 0.99),
-            lambda_=getattr(cfg, "lambda_", 0.95),
-            kl_scale=getattr(cfg, "kl_scale", 1.0),
-            free_nats=getattr(cfg, "free_nats", 1.0),
-        )
-        self.world_model.to(next(self.parameters()).device)
-        self.world_model.to(dtype=next(self.parameters()).dtype)
-        return self.world_model
-
-    def _prepare_world_model_inputs(
-        self, forward_inputs: dict[str, Any]
-    ) -> dict[str, Any]:
-        curr_obs = forward_inputs.get("curr_obs")
-        if curr_obs is None:
-            states = forward_inputs.get(
-                "states", forward_inputs.get("state", forward_inputs.get("curr_states"))
-            )
-            if states is None:
-                raise KeyError(
-                    "DreamZero default_forward requires forward_inputs['curr_obs'] "
-                    "or a state tensor under 'states'/'state'/'curr_states'."
-                )
-            curr_obs = {"states": states}
-
-        next_obs = forward_inputs.get("next_obs")
-        if next_obs is None and "next_states" in forward_inputs:
-            next_obs = {"states": forward_inputs["next_states"]}
-
-        actions = forward_inputs.get("actions", forward_inputs.get("action"))
-        if actions is None:
-            raise KeyError("DreamZero default_forward requires actions.")
-        actions = self._restore_world_model_actions(actions)
-
-        rewards = forward_inputs.get("rewards")
-        if rewards is None:
-            rewards = torch.zeros(
-                *actions.shape[:2],
-                1,
-                dtype=actions.dtype,
-                device=actions.device,
-            )
-
-        dones = forward_inputs.get("dones")
-        if dones is None:
-            dones = torch.zeros(
-                *actions.shape[:2],
-                1,
-                dtype=torch.bool,
-                device=actions.device,
-            )
-
-        curr_obs = {"states": self._ensure_batch_time(curr_obs["states"], "curr_obs")}
-        if next_obs is not None:
-            next_obs = {
-                "states": self._ensure_batch_time(next_obs["states"], "next_obs")
-            }
-        actions = self._ensure_batch_time(actions, "actions")
-        curr_obs["states"] = self._flatten_world_model_time_axes(
-            curr_obs["states"], "curr_obs"
-        )
-        if next_obs is not None:
-            next_obs["states"] = self._flatten_world_model_time_axes(
-                next_obs["states"], "next_obs"
-            )
-        actions = self._flatten_world_model_time_axes(actions, "actions")
-        curr_obs["states"] = self._align_world_model_states_to_actions(
-            curr_obs["states"], actions, "curr_obs"
-        )
-        if next_obs is not None:
-            next_obs["states"] = self._align_world_model_states_to_actions(
-                next_obs["states"], actions, "next_obs"
-            )
-        if curr_obs["states"].shape[1] == 1 and actions.shape[1] > 1:
-            curr_obs["states"] = curr_obs["states"].expand(
-                curr_obs["states"].shape[0],
-                actions.shape[1],
-                *curr_obs["states"].shape[2:],
-            )
-        if (
-            next_obs is not None
-            and next_obs["states"].shape[1] == 1
-            and actions.shape[1] > 1
-        ):
-            next_obs["states"] = next_obs["states"].expand(
-                next_obs["states"].shape[0],
-                actions.shape[1],
-                *next_obs["states"].shape[2:],
-            )
-        rewards = self._ensure_batch_time(rewards, "rewards")
-        dones = self._ensure_batch_time(dones, "dones")
-        rewards = self._flatten_world_model_time_axes(rewards, "rewards")
-        dones = self._flatten_world_model_time_axes(dones, "dones")
-
-        return {
-            "curr_obs": curr_obs,
-            "next_obs": next_obs,
-            "actions": actions,
-            "rewards": rewards,
-            "dones": dones,
-        }
-
-    @staticmethod
-    def _ensure_batch_time(tensor: torch.Tensor, name: str) -> torch.Tensor:
-        if tensor.ndim < 2:
-            raise ValueError(f"{name} must have at least batch/time dims.")
-        if tensor.ndim == 2:
-            tensor = tensor.unsqueeze(1)
-        return tensor
-
-    def _restore_world_model_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        if actions.ndim != 2:
-            return actions
-        env_action_dim = getattr(self.config, "env_action_dim", None)
-        if not env_action_dim:
-            return actions
-        if actions.shape[-1] == env_action_dim:
-            return actions
-        if actions.shape[-1] % env_action_dim != 0:
-            return actions
-        return actions.reshape(actions.shape[0], -1, env_action_dim)
-
-    @staticmethod
-    def _flatten_world_model_time_axes(tensor: torch.Tensor, name: str) -> torch.Tensor:
-        if tensor.ndim < 3:
-            return tensor
-        if tensor.ndim == 3:
-            return tensor
-        return tensor.reshape(tensor.shape[0], -1, tensor.shape[-1])
-
-    @staticmethod
-    def _align_world_model_states_to_actions(
-        states: torch.Tensor,
-        actions: torch.Tensor,
-        name: str,
-    ) -> torch.Tensor:
-        if states.ndim != 3 or actions.ndim != 3:
-            return states
-        action_time = actions.shape[1]
-        if states.shape[1] == action_time:
-            return states
-        if states.shape[1] == action_time * actions.shape[-1]:
-            return states.reshape(
-                states.shape[0],
-                action_time,
-                actions.shape[-1],
-                states.shape[-1],
-            )[:, :, 0, :].contiguous()
-        if states.shape[-1] == action_time:
-            return states.transpose(1, 2).contiguous()
-        return states

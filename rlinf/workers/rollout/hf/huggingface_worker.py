@@ -645,6 +645,29 @@ class MultiStepRolloutWorker(Worker):
                 return tuple(None for _ in sizes)
             return tuple(torch.split(tensor, sizes, dim=0))
 
+        def _split_payload(value: Any) -> list[Any]:
+            if torch.is_tensor(value):
+                return list(torch.split(value, sizes, dim=0))
+            if isinstance(value, dict):
+                split_items = {key: _split_payload(item) for key, item in value.items()}
+                return [
+                    {key: split_values[idx] for key, split_values in split_items.items()}
+                    for idx in range(len(sizes))
+                ]
+            if isinstance(value, tuple):
+                split_items = [_split_payload(item) for item in value]
+                return [
+                    tuple(split_values[idx] for split_values in split_items)
+                    for idx in range(len(sizes))
+                ]
+            if isinstance(value, list):
+                split_items = [_split_payload(item) for item in value]
+                return [
+                    [split_values[idx] for split_values in split_items]
+                    for idx in range(len(sizes))
+                ]
+            return [copy.deepcopy(value) for _ in sizes]
+
         split_actions = _split_optional_tensor(rollout_result.actions)
         split_prev_logprobs = _split_optional_tensor(rollout_result.prev_logprobs)
         split_prev_values = _split_optional_tensor(rollout_result.prev_values)
@@ -654,13 +677,7 @@ class MultiStepRolloutWorker(Worker):
         split_forward_inputs = (
             [{} for _ in sizes]
             if not rollout_result.forward_inputs
-            else [
-                {
-                    key: torch.split(value, sizes, dim=0)[idx]
-                    for key, value in rollout_result.forward_inputs.items()
-                }
-                for idx in range(len(sizes))
-            ]
+            else _split_payload(rollout_result.forward_inputs)
         )
 
         return [

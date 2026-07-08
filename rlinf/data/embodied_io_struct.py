@@ -678,19 +678,16 @@ class EmbodiedRolloutResult:
             trajectory.versions = torch.stack(self.versions, dim=0).cpu().contiguous()
         if len(self.forward_inputs) > 0:
             trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
-            for key in trajectory.forward_inputs.keys():
-                trajectory.forward_inputs[key] = (
-                    trajectory.forward_inputs[key].cpu().contiguous()
-                )
+            trajectory.forward_inputs = put_tensor_device(
+                trajectory.forward_inputs, "cpu"
+            )
 
         if len(self.curr_obs) > 0:
             trajectory.curr_obs = stack_list_of_dict_tensor(self.curr_obs)
-            for key in trajectory.curr_obs.keys():
-                trajectory.curr_obs[key] = trajectory.curr_obs[key].cpu().contiguous()
+            trajectory.curr_obs = put_tensor_device(trajectory.curr_obs, "cpu")
         if len(self.next_obs) > 0:
             trajectory.next_obs = stack_list_of_dict_tensor(self.next_obs)
-            for key in trajectory.next_obs.keys():
-                trajectory.next_obs[key] = trajectory.next_obs[key].cpu().contiguous()
+            trajectory.next_obs = put_tensor_device(trajectory.next_obs, "cpu")
 
         trajectory.model_weights_id = get_model_weights_id(
             trajectory.versions
@@ -752,9 +749,29 @@ class EmbodiedRolloutResult:
         return splited_trajectories
 
 
+def _cat_nested_trajectory_values(values: list[Any], dim: int) -> Any:
+    if not values:
+        return None
+
+    ref_value = values[0]
+    if isinstance(ref_value, torch.Tensor):
+        return torch.cat(values, dim=dim)
+    if isinstance(ref_value, dict):
+        all_keys: set[str] = set()
+        for value in values:
+            all_keys.update(value.keys())
+        return {
+            key: _cat_nested_trajectory_values(
+                [value[key] for value in values if key in value], dim
+            )
+            for key in all_keys
+        }
+    raise ValueError(f"Unsupported nested trajectory value type: {type(ref_value)}")
+
+
 def convert_trajectories_to_batch(
     trajectories: list[Trajectory],
-) -> dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     """
     convert a list of trajectories to a batch dict, the shape of the batch is [T, B, ...].
     """
@@ -800,7 +817,9 @@ def convert_trajectories_to_batch(
                 if key in traj.forward_inputs
             ]
             if tensors:
-                batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
+                batch["forward_inputs"][key] = _cat_nested_trajectory_values(
+                    tensors, dim=1
+                )
 
     # -------- tensor fields --------
     reference_trajectory = trajectories[0]

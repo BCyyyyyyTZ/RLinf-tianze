@@ -198,6 +198,15 @@ def get_model(cfg: DictConfig, torch_dtype=None):
 
     dreamzero_config.env_action_dim = cfg.get("env_action_dim", 7)
     dreamzero_config.gradient_checkpointing = cfg.get("gradient_checkpointing", False)
+    dreamzero_config.add_value_head = bool(cfg.get("add_value_head", False))
+    dreamzero_config.noise_method = str(cfg.get("noise_method", "flow_sde"))
+    dreamzero_config.noise_level = float(cfg.get("noise_level", 0.5))
+    dreamzero_config.safe_get_logprob = bool(cfg.get("safe_get_logprob", False))
+    dreamzero_config.joint_logprob = bool(cfg.get("joint_logprob", False))
+    dreamzero_config.num_steps = int(cfg.get("num_steps", 10))
+    dreamzero_config.ppo_deterministic_eval = bool(
+        cfg.get("ppo_deterministic_eval", True)
+    )
 
     embodiment_tag = cfg.get("embodiment_tag", "libero_sim")
     metadata = load_dreamzero_dataset_metadata(cfg)
