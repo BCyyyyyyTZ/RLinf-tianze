@@ -153,6 +153,15 @@ def should_log_actor_training_progress(index: int, total: int) -> bool:
     return index == 0 or index == total - 1 or (index + 1) % max(1, total // 16) == 0
 
 
+def dreamzero_actor_memory_probe_enabled() -> bool:
+    return os.getenv("DREAMZERO_ACTOR_MEMORY_PROBE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def get_dreamzero_loss_action_dim(model_cfg, loss_type: str) -> int:
     action_dim = model_cfg.get("action_dim", 7)
     model_type = model_cfg.get("model_type")
@@ -1155,6 +1164,51 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return model
 
+    def _log_memory_probe(self, label: str, *, sync: bool = False) -> None:
+        if not dreamzero_actor_memory_probe_enabled():
+            return
+        if not torch.cuda.is_available():
+            self.log_info(f"[actor memory] {label} cuda_unavailable pid={os.getpid()}")
+            return
+
+        device = torch.cuda.current_device()
+        if sync:
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                pass
+        gb = 1024**3
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        allocated = torch.cuda.memory_allocated(device)
+        reserved = torch.cuda.memory_reserved(device)
+        max_allocated = torch.cuda.max_memory_allocated(device)
+        max_reserved = torch.cuda.max_memory_reserved(device)
+        inactive_split = 0
+        active = 0
+        try:
+            stats = torch.cuda.memory_stats(device)
+            inactive_split = int(stats.get("inactive_split_bytes.all.current", 0))
+            active = int(stats.get("active_bytes.all.current", 0))
+        except Exception:
+            pass
+        self.log_info(
+            "[actor memory] "
+            f"label={label} "
+            f"rank={self._rank}/{self._world_size} "
+            f"pid={os.getpid()} "
+            f"local_rank={os.environ.get('LOCAL_RANK')} "
+            f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES')} "
+            f"device={device} "
+            f"free_gib={free_bytes / gb:.2f} "
+            f"total_gib={total_bytes / gb:.2f} "
+            f"allocated_gib={allocated / gb:.2f} "
+            f"reserved_gib={reserved / gb:.2f} "
+            f"active_gib={active / gb:.2f} "
+            f"inactive_split_gib={inactive_split / gb:.2f} "
+            f"max_allocated_gib={max_allocated / gb:.2f} "
+            f"max_reserved_gib={max_reserved / gb:.2f}"
+        )
+
     def get_rollout_state_dict(self) -> dict:
         state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
         if any(key.startswith("world_model.") for key in state_dict):
@@ -1496,14 +1550,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Run the training process using the received rollout batch.
         """
         run_started = time.monotonic()
+        self._log_memory_probe("run_training_entry", sync=True)
         if self.is_weight_offloaded:
             self.log_on_first_rank("actor training: loading offloaded parameters")
             self.load_param_and_grad(self.device)
+            self._log_memory_probe("after_load_param_and_grad", sync=True)
         if self.is_optimizer_offloaded:
             self.log_on_first_rank("actor training: loading offloaded optimizer")
             self.load_optimizer(self.device)
+            self._log_memory_probe("after_load_optimizer", sync=True)
 
         self.model.train()
+        self._log_memory_probe("after_model_train", sync=True)
         rollout_size = get_dreamzero_train_rollout_size(
             self.rollout_batch,
             self.cfg.algorithm.get("loss_type", ""),
@@ -1516,6 +1574,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
             )
+        self._log_memory_probe("after_rollout_batch_shuffle", sync=True)
 
         assert (
             self.cfg.actor.global_batch_size
@@ -1607,9 +1666,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         batch,
                         f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
                     )
+                    self._log_memory_probe(
+                        f"micro_{micro_index + 1}_after_batch_to_device",
+                        sync=True,
+                    )
                     backward_ctx = self.before_micro_batch(
                         self.model,
                         is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
+                    )
+                    self._log_memory_probe(
+                        f"micro_{micro_index + 1}_after_before_micro_batch",
+                        sync=True,
                     )
                     advantages = batch["advantages"]
                     prev_logprobs = batch["prev_logprobs"]
@@ -1640,6 +1707,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     )
 
                     forward_started = time.monotonic()
+                    self._log_memory_probe(
+                        f"micro_{micro_index + 1}_before_forward",
+                        sync=True,
+                    )
                     with self.amp_context:
                         output_dict = self.model(
                             forward_inputs=forward_inputs,
@@ -1649,6 +1720,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             use_cache=False,
                             **kwargs,
                         )
+                    self._log_memory_probe(
+                        f"micro_{micro_index + 1}_after_forward",
+                        sync=True,
+                    )
                     if log_progress:
                         self.log_info(
                             "actor training: model forward done "
@@ -1689,6 +1764,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         < self.critic_warmup_steps,
                     }
                     loss, metrics_data = policy_loss(**kwargs)
+                    self._log_memory_probe(
+                        f"micro_{micro_index + 1}_after_policy_loss",
+                        sync=True,
+                    )
 
                     entropy_loss = torch.tensor(
                         0.0, device=Worker.torch_platform.current_device()
@@ -1713,8 +1792,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                     loss /= self.gradient_accumulation
                     backward_started = time.monotonic()
-                    with backward_ctx:
-                        self.grad_scaler.scale(loss).backward()
+                    self._log_memory_probe(
+                        f"micro_{micro_index + 1}_before_backward",
+                        sync=True,
+                    )
+                    try:
+                        with backward_ctx:
+                            self.grad_scaler.scale(loss).backward()
+                    except torch.cuda.OutOfMemoryError:
+                        self._log_memory_probe(
+                            f"micro_{micro_index + 1}_backward_oom",
+                            sync=False,
+                        )
+                        raise
+                    self._log_memory_probe(
+                        f"micro_{micro_index + 1}_after_backward",
+                        sync=True,
+                    )
                     if log_progress:
                         self.log_info(
                             "actor training: backward done "
@@ -1726,7 +1820,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     append_to_dict(metrics, metrics_data)
                     # avoid gpu memory leak
                     train_micro_batch[idx] = None
+                    self._log_memory_probe(
+                        f"micro_{micro_index + 1}_before_del_tensors",
+                        sync=True,
+                    )
                     del batch, output_dict, forward_inputs, loss, metrics_data
+                    self._log_memory_probe(
+                        f"micro_{micro_index + 1}_after_del_tensors",
+                        sync=True,
+                    )
 
                 if self._rank == 0:
                     self.log_info(
@@ -1737,6 +1839,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     )
                 empty_cache_started = time.monotonic()
                 self.torch_platform.empty_cache()
+                self._log_memory_probe(
+                    f"global_{global_batch_idx + 1}_after_empty_cache",
+                    sync=True,
+                )
                 if self._rank == 0:
                     self.log_info(
                         "actor training: empty_cache done "
@@ -1745,7 +1851,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     )
 
                 optimizer_started = time.monotonic()
+                self._log_memory_probe(
+                    f"global_{global_batch_idx + 1}_before_optimizer_step",
+                    sync=True,
+                )
                 grad_norm, lr_list = self.optimizer_step()
+                self._log_memory_probe(
+                    f"global_{global_batch_idx + 1}_after_optimizer_step",
+                    sync=True,
+                )
                 if self._rank == 0:
                     self.log_info(
                         "actor training: optimizer step done "

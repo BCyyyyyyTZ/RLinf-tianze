@@ -93,8 +93,9 @@ def _run_diffusion_steps(
     for index, prompt_emb in enumerate(context):
         kv_cache = kv_caches[index]
         crossattn_cache = crossattn_caches[index]
-        if not kv_cache_metadata["update_kv_cache"] and self.trt_engine is not None:
-            obs_noise_pred, action_noise_pred = self.trt_engine(
+        trt_engine = getattr(self, "trt_engine", None)
+        if not kv_cache_metadata["update_kv_cache"] and trt_engine is not None:
+            obs_noise_pred, action_noise_pred = trt_engine(
                 noisy_input,
                 timestep,
                 action=action,

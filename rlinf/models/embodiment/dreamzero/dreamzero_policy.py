@@ -27,6 +27,9 @@ from rlinf.data.datasets.dreamzero.data_transforms import (
     DreamZeroObservationTransform,
 )
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only import (
+    _action_only_video_context,
+)
 from rlinf.models.embodiment.dreamzero.ppo_policy import DreamZeroPPOPolicyMixin
 from rlinf.utils.logging import get_logger
 
@@ -377,7 +380,8 @@ class DreamZeroPolicy(DreamZeroPPOPolicyMixin, VLA, BasePolicy):
             device=x_t.device,
             dtype=torch.bool,
         )
-        pred = self.lazy_joint_video_action_causal(obs, return_video=False)["action_pred"]
+        with _action_only_video_context(enabled=True):
+            pred = self.lazy_joint_video_action_causal(obs)["action_pred"]
         pred = pred.to(device=x_t.device, dtype=torch.float32)
         timestep = timestep.to(device=x_t.device, dtype=torch.float32)
         if timestep.ndim == 1:
