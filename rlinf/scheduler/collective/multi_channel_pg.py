@@ -40,6 +40,23 @@ class MultiChannelProcessGroup:
 
     """
 
+    _CHANNEL_ROOT_GROUP_NAMES = {
+        "Actor",
+        "ActorInference",
+        "CriticOutput",
+        "DataLoader",
+        "Env",
+        "EnvMetric",
+        "GenerateInput",
+        "GenerateOutput",
+        "Inference",
+        "Reward",
+        "Rollout",
+        "RolloutMetric",
+        "ToolOutput",
+        "Value",
+    }
+
     def __init__(
         self,
         cur_rank: int,
@@ -68,10 +85,18 @@ class MultiChannelProcessGroup:
         # Check if all workers have the same accelerator type
         accel_type = group_info.workers[0].accelerator_type
         accel_model = group_info.workers[0].accelerator_model
+        channel_worker_group = any(
+            worker.address.root_group_name in self._CHANNEL_ROOT_GROUP_NAMES
+            or worker.address.root_group_name.startswith("Tool-")
+            for worker in group_info.workers
+        )
         self._no_accel_ccl = (
+            # ChannelWorker payloads are routed through object/CPU channels. Do not
+            # eagerly create NCCL groups for them just because the worker was placed
+            # on a GPU node; doing so can abort Ray ChannelWorker processes.
+            channel_worker_group
             # Hetero accelerator models in the same group, disable CCL
-            # NCCL for example does not support mixed GPU models
-            any(
+            or any(
                 worker.accelerator_model != accel_model for worker in group_info.workers
             )
             # CPU only, disable CCL

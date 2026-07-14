@@ -26,6 +26,8 @@ import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.models.embodiment.dreamzero.world_model import DreamZeroWorldModel
 from rlinf.workers.actor.fsdp_actor_worker import (
+    align_dreamzero_aux_to_logprobs,
+    build_dreamzero_logprob_probe,
     build_dreamzero_forward_inputs,
     get_dreamzero_train_rollout_size,
     get_dreamzero_loss_action_dim,
@@ -67,17 +69,34 @@ def test_dreamzero_world_model_proxy_loss_type_is_removed():
         )
 
 
-def test_dreamzero_standard_ppo_uses_action_dim_for_loss_reshape():
+def test_dreamzero_standard_ppo_uses_env_action_dim_for_loss_reshape():
     model_cfg = {
         "model_type": "dreamzero",
         "action_dim": 32,
         "env_action_dim": 7,
     }
 
-    assert get_dreamzero_loss_action_dim(model_cfg, loss_type="actor_critic") == 32
+    assert get_dreamzero_loss_action_dim(model_cfg, loss_type="actor_critic") == 7
 
 
-def test_standard_dreamzero_ppo_uses_action_dim_for_actor_critic():
+def test_dreamzero_logprob_probe_reports_chunk_sum_log_ratio():
+    new_logprobs = torch.ones(2, 4, 3, dtype=torch.float32) * 10.0
+    old_logprobs = torch.zeros_like(new_logprobs)
+
+    probe = build_dreamzero_logprob_probe(
+        logprobs=new_logprobs,
+        old_logprobs=old_logprobs,
+        logprob_type="chunk_level",
+        single_action_dim=3,
+    )
+
+    assert probe["raw_log_ratio"]["max"] == 10.0
+    assert probe["agg_log_ratio"]["shape"] == (2,)
+    assert probe["agg_log_ratio"]["max"] == 120.0
+    assert probe["ratio_exp_clipped_88"]["finite"] == 2
+
+
+def test_standard_dreamzero_ppo_uses_env_action_dim_for_actor_critic():
     model_cfg = OmegaConf.create(
         {
             "model_type": "dreamzero",
@@ -86,8 +105,71 @@ def test_standard_dreamzero_ppo_uses_action_dim_for_actor_critic():
         }
     )
 
-    assert get_dreamzero_loss_action_dim(model_cfg, "actor_critic") == 32
-    assert get_dreamzero_loss_action_dim(model_cfg, "decoupled_actor_critic") == 32
+    assert get_dreamzero_loss_action_dim(model_cfg, "actor_critic") == 7
+    assert get_dreamzero_loss_action_dim(model_cfg, "decoupled_actor_critic") == 7
+
+
+def test_dreamzero_aux_alignment_follows_compacted_logprobs():
+    logprobs = torch.zeros(2, 16, 7)
+    versions = torch.ones(2, 16, 32)
+
+    aligned_versions = align_dreamzero_aux_to_logprobs(versions, logprobs)
+
+    assert aligned_versions.shape == logprobs.shape
+    assert torch.equal(aligned_versions, versions[..., :7])
+
+
+def test_decoupled_ppo_log_ratio_clamp_keeps_ratios_finite():
+    loss, metrics = policy_loss(
+        task_type="embodied",
+        loss_type="decoupled_actor_critic",
+        logprob_type="chunk_level",
+        reward_type="chunk_level",
+        single_action_dim=7,
+        logprobs=torch.full((2, 16, 7), 1000.0, dtype=torch.float32),
+        old_logprobs=torch.zeros(2, 16, 7, dtype=torch.float32),
+        proximal_logprobs=torch.zeros(2, 16, 7, dtype=torch.float32),
+        advantages=torch.ones(2, dtype=torch.float32),
+        values=torch.zeros(2, 1, dtype=torch.float32),
+        prev_values=torch.zeros(2, 1, dtype=torch.float32),
+        returns=torch.zeros(2, dtype=torch.float32),
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        value_clip=0.2,
+        huber_delta=1.0,
+        clip_log_ratio_min=-20,
+        clip_log_ratio_max=20,
+        task_type_for_test="ignored",
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(torch.as_tensor(metrics["actor/proximal_ratio"]))
+    assert torch.isfinite(torch.as_tensor(metrics["actor/proximal_approx_kl"]))
+
+
+def test_ppo_critic_explained_variance_is_finite_for_constant_returns():
+    loss, metrics = policy_loss(
+        task_type="embodied",
+        loss_type="actor_critic",
+        logprob_type="chunk_level",
+        reward_type="chunk_level",
+        single_action_dim=7,
+        logprobs=torch.zeros(1, 1, 7, dtype=torch.float32),
+        old_logprobs=torch.zeros(1, 1, 7, dtype=torch.float32),
+        advantages=torch.zeros(1, dtype=torch.float32),
+        values=torch.zeros(1, dtype=torch.float32),
+        prev_values=torch.zeros(1, dtype=torch.float32),
+        returns=torch.zeros(1, dtype=torch.float32),
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        value_clip=0.2,
+        huber_delta=1.0,
+    )
+
+    assert torch.isfinite(loss)
+    explained_variance = torch.as_tensor(metrics["critic/explained_variance"])
+    assert torch.isfinite(explained_variance)
+    assert explained_variance.item() == 0.0
 
 
 def test_dreamzero_legacy_loss_type_is_not_a_world_model_proxy_alias():
@@ -485,6 +567,12 @@ def test_dreamzero_get_model_registers_action_only_video_postprocess_patches(mon
         == "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only._run_diffusion_steps"
     )
     assert (
+        mappings[
+            "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead.predict_action_velocity_only"
+        ]
+        == "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only.predict_action_velocity_only"
+    )
+    assert (
         "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead.lazy_joint_video_action"
         in wrappers
     )
@@ -742,6 +830,83 @@ def test_dreamzero_wan_policy_head_uses_configured_inference_timesteps():
     assert head.num_inference_steps == 4
 
 
+def test_dreamzero_wan_velocity_only_calls_single_action_forward(monkeypatch):
+    wan_module = pytest.importorskip(
+        "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf"
+    )
+
+    class FakeScheduler:
+        num_train_timesteps = 1000
+
+    class FakeModel(torch.nn.Module):
+        in_dim = 4
+
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.last_timestep_action = None
+            self.last_noisy_shape = None
+            self.num_heads = 1
+            self.dim = 4
+            self.num_layers = 1
+
+        def forward(self, noisy_input, timestep, **kwargs):
+            self.calls += 1
+            self.last_noisy_shape = tuple(noisy_input.shape)
+            self.last_timestep_action = kwargs["timestep_action"].detach().clone()
+            action = kwargs["action"]
+            return None, torch.ones_like(action) * 0.25
+
+    head = object.__new__(wan_module.WANPolicyHead)
+    torch.nn.Module.__init__(head)
+    head.model = FakeModel()
+    head.scheduler = FakeScheduler()
+    head.num_frame_per_block = 2
+    head.cfg_scale = 1.0
+    head.ip_size = 1
+    head._device = "cpu"
+
+    monkeypatch.setattr(head, "set_frozen_modules_to_eval_mode", lambda: None)
+    monkeypatch.setattr(head, "release_inference_cache", lambda: None)
+    monkeypatch.setattr(head, "prepare_input", lambda obs: types.SimpleNamespace(**obs))
+    monkeypatch.setattr(
+        head,
+        "_prepare_action_velocity_context",
+        lambda action_input: {
+            "prompt_embs": [torch.zeros(2, 1, 4)],
+            "state_features": torch.zeros(2, 1, 4),
+            "embodiment_id": torch.zeros(2, dtype=torch.long),
+            "clip_feas": torch.zeros(2, 1, 4),
+            "ys": torch.zeros(2, 4, 3, 2, 2),
+            "batch_size": 2,
+            "velocity_num_frames": 3,
+            "seq_len": 3,
+            "frame_seqlen": 1,
+            "latent_h": 2,
+            "latent_w": 2,
+            "dtype": torch.float32,
+            "device": torch.device("cpu"),
+        },
+    )
+
+    x_t = torch.zeros(2, 4, 3)
+    output = head.predict_action_velocity_only(
+        {"state": torch.zeros(2, 1, 4)},
+        x_t,
+        torch.tensor([1.0, 0.5]),
+    )
+
+    assert head.model.calls == 1
+    assert head.model.last_noisy_shape == (2, 4, 3, 2, 2)
+    assert torch.equal(
+        head.model.last_timestep_action,
+        torch.tensor([[999, 999, 999, 999], [500, 500, 500, 500]]),
+    )
+    assert output["velocity"].shape == x_t.shape
+    assert output["velocity"].dtype == torch.float32
+    assert output["value_feature"].shape == (2, 3)
+
+
 def test_dreamzero_causal_inference_blocks_use_gradient_checkpointing(monkeypatch):
     import torch.utils.checkpoint
 
@@ -822,8 +987,16 @@ def test_dreamzero_libero_observation_transform_builds_inference_modalities():
 
     converted = transform.convert(env_obs)
 
-    assert converted["video.image"].shape == (2, 1, 256, 256, 3)
-    assert converted["video.wrist_image"].shape == (2, 1, 256, 256, 3)
+    assert converted["video.image"].shape == (2, 4, 256, 256, 3)
+    assert converted["video.wrist_image"].shape == (2, 4, 256, 256, 3)
+    assert torch.equal(
+        torch.as_tensor(converted["video.image"][:, 0]),
+        torch.as_tensor(converted["video.image"][:, -1]),
+    )
+    assert torch.equal(
+        torch.as_tensor(converted["video.wrist_image"][:, 0]),
+        torch.as_tensor(converted["video.wrist_image"][:, -1]),
+    )
     assert converted["state.state"].shape == (2, 1, 8)
     assert converted["state.joint_position"].shape == (2, 1, 7)
     assert converted["state.gripper_position"].shape == (2, 1, 1)

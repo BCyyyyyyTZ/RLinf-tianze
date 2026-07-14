@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -40,6 +41,8 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
         action_obs: dict[str, Any],
         x_t: torch.Tensor,
         timestep: torch.Tensor,
+        *,
+        use_velocity_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
@@ -61,6 +64,57 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
         noise_level = float(getattr(self.config, "noise_level", 0.5))
         return torch.tensor(noise_level, device=device, dtype=dtype)
 
+    def _use_velocity_only_for_ppo(self) -> bool:
+        return bool(getattr(self.config, "ppo_use_velocity_only", False))
+
+    @staticmethod
+    def _use_velocity_only_from_forward_inputs(
+        forward_inputs: dict[str, Any],
+        default: bool,
+    ) -> bool:
+        value = forward_inputs.get("dreamzero_ppo.use_velocity_only", default)
+        if torch.is_tensor(value):
+            return bool(value.detach().reshape(-1)[0].item())
+        return bool(value)
+
+    @contextmanager
+    def _dreamzero_ppo_deterministic_context(self):
+        was_training = self.training
+        self.eval()
+        try:
+            yield
+        finally:
+            self.train(was_training)
+
+    def _select_policy_action_dims(
+        self,
+        tensor: torch.Tensor,
+        action_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if action_mask is not None:
+            mask = action_mask.to(device=tensor.device, dtype=torch.bool)
+            while mask.ndim < tensor.ndim:
+                mask = mask.unsqueeze(1)
+            if mask.shape == tensor.shape:
+                dim_mask = mask.reshape(-1, mask.shape[-1]).any(dim=0)
+                if bool(dim_mask.any()):
+                    return tensor.index_select(
+                        -1,
+                        torch.nonzero(dim_mask, as_tuple=False).flatten(),
+                    )
+
+        action_dim = int(getattr(self.config, "action_dim", tensor.shape[-1]))
+        env_action_dim = int(getattr(self.config, "env_action_dim", action_dim))
+        policy_action_dim = int(
+            getattr(
+                self.config,
+                "ppo_loss_action_dim",
+                min(action_dim, env_action_dim),
+            )
+        )
+        policy_action_dim = max(1, min(policy_action_dim, tensor.shape[-1]))
+        return tensor[..., :policy_action_dim]
+
     def dreamzero_action_sample_mean_var_val(
         self,
         *,
@@ -70,6 +124,7 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
         sample_method: str,
         denoise_steps: int,
         compute_values: bool = True,
+        use_velocity_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bsize = x_t.shape[0]
         device = x_t.device
@@ -82,7 +137,7 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
         t_input = timesteps[idx]
         delta = timesteps[idx] - timesteps[idx + 1]
         v_t, value_features = self._predict_action_only_velocity(
-            action_obs, x_t, t_input
+            action_obs, x_t, t_input, use_velocity_only=use_velocity_only
         )
         delta = delta[:, None, None].expand_as(x_t)
         t_input = t_input[:, None, None].expand_as(x_t)
@@ -130,49 +185,66 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
         chains = [x_t]
         log_probs = []
         values = []
+        joint_logprob = bool(getattr(self.config, "joint_logprob", False))
+        use_velocity_only = self._use_velocity_only_for_ppo()
         if mode == "train":
-            if bool(getattr(self.config, "joint_logprob", False)):
+            if joint_logprob:
                 denoise_inds = torch.arange(num_steps, device=x_t.device)[None].repeat(
                     bsize, 1
                 )
             else:
-                denoise_inds = torch.randint(
-                    0, num_steps, (bsize, 1), device=x_t.device
+                selected_denoise_ind = torch.randint(
+                    0, num_steps, (1,), device=x_t.device
                 )
+                denoise_inds = selected_denoise_ind[None].repeat(bsize, 1)
         else:
             denoise_inds = torch.full(
                 (bsize, 1), num_steps - 1, device=x_t.device, dtype=torch.long
             )
 
-        for idx in range(num_steps):
-            x_t_mean, x_t_std, value_t, _ = self.dreamzero_action_sample_mean_var_val(
-                x_t=x_t,
-                idx=idx,
-                action_obs=action_obs,
-                sample_method=str(getattr(self.config, "noise_method", "flow_sde")),
-                denoise_steps=num_steps,
-                compute_values=compute_values,
-            )
-            x_t = x_t_mean + torch.randn_like(x_t_mean) * x_t_std
-            chains.append(x_t)
-            log_probs.append(
-                dreamzero_action_get_logprob_norm(
-                    x_t,
-                    x_t_mean,
-                    x_t_std,
-                    safe_get_logprob=bool(
-                        getattr(self.config, "safe_get_logprob", False)
-                    ),
+        configured_sample_method = str(getattr(self.config, "noise_method", "flow_sde"))
+        with self._dreamzero_ppo_deterministic_context():
+            for idx in range(num_steps):
+                if joint_logprob:
+                    sample_method = configured_sample_method
+                elif mode == "train":
+                    is_selected_step = bool(torch.all(denoise_inds[:, 0] == idx).item())
+                    sample_method = (
+                        configured_sample_method
+                        if is_selected_step
+                        else "flow_ode"
+                    )
+                else:
+                    sample_method = "flow_ode"
+                x_t_mean, x_t_std, value_t, _ = self.dreamzero_action_sample_mean_var_val(
+                    x_t=x_t,
+                    idx=idx,
+                    action_obs=action_obs,
+                    sample_method=sample_method,
+                    denoise_steps=num_steps,
+                    compute_values=compute_values,
+                    use_velocity_only=use_velocity_only,
                 )
-            )
-            values.append(value_t)
+                x_t = x_t_mean + torch.randn_like(x_t_mean) * x_t_std
+                chains.append(x_t)
+                log_probs.append(
+                    dreamzero_action_get_logprob_norm(
+                        x_t,
+                        x_t_mean,
+                        x_t_std,
+                        safe_get_logprob=bool(
+                            getattr(self.config, "safe_get_logprob", False)
+                        ),
+                    )
+                )
+                values.append(value_t)
 
         chains_tensor = torch.stack(chains, dim=1)
         logprob_tensor = torch.stack(log_probs, dim=1)
         value_tensor = torch.stack(values, dim=1)
         action_mask = self._build_action_mask(chains_tensor[:, -1])
 
-        if bool(getattr(self.config, "joint_logprob", False)) and mode == "train":
+        if joint_logprob and mode == "train":
             selected_logprobs = logprob_tensor
             selected_values = value_tensor.mean(dim=1)
             selected_logprobs = selected_logprobs.masked_fill(
@@ -180,6 +252,7 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
             )
             prev_logprobs = selected_logprobs.reshape(bsize, num_steps, -1).mean(dim=1)
             prev_logprobs = prev_logprobs.reshape_as(chains_tensor[:, -1])
+            prev_logprobs = self._select_policy_action_dims(prev_logprobs, action_mask)
             prev_values = selected_values[:, None]
             return chains_tensor, denoise_inds, prev_logprobs, prev_values
 
@@ -188,6 +261,7 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
         selected_values = value_tensor[batch_indices, denoise_inds[:, 0]]
         selected_logprobs = selected_logprobs.masked_fill(~action_mask, 0.0)
         prev_logprobs = selected_logprobs.reshape_as(chains_tensor[:, -1])
+        prev_logprobs = self._select_policy_action_dims(prev_logprobs, action_mask)
         prev_values = selected_values[:, None]
         return chains_tensor, denoise_inds, prev_logprobs, prev_values
 
@@ -207,6 +281,12 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
                 "chains": chains,
                 "denoise_inds": denoise_inds,
                 "dreamzero_ppo.action_mask": action_mask,
+                "dreamzero_ppo.use_velocity_only": torch.full(
+                    (chains.shape[0],),
+                    self._use_velocity_only_for_ppo(),
+                    dtype=torch.bool,
+                    device=chains.device,
+                ),
                 "model_action": model_action,
                 "action": env_action,
             }
@@ -235,6 +315,10 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
             denoise_inds=denoise_inds,
             action_mask=action_mask,
             compute_values=compute_values,
+            use_velocity_only=self._use_velocity_only_from_forward_inputs(
+                forward_inputs,
+                self._use_velocity_only_for_ppo(),
+            ),
         )
 
         result: dict[str, torch.Tensor] = {}
@@ -254,6 +338,7 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
         denoise_inds: torch.Tensor,
         action_mask: torch.Tensor | None,
         compute_values: bool,
+        use_velocity_only: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsize = chains.shape[0]
         batch_indices = torch.arange(bsize, device=chains.device)
@@ -264,33 +349,37 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
         logprob_steps = []
         value_steps = []
         entropy_steps = []
-        for idx in range(num_steps):
-            denoise_ind = denoise_inds[:, idx]
-            chains_pre = chains[batch_indices, denoise_ind]
-            chains_next = chains[batch_indices, denoise_ind + 1]
-            x_t_mean, x_t_std, value_t, _ = self.dreamzero_action_sample_mean_var_val(
-                x_t=chains_pre,
-                idx=denoise_ind,
-                action_obs=action_obs,
-                sample_method=str(getattr(self.config, "noise_method", "flow_sde")),
-                denoise_steps=int(getattr(self.config, "num_steps", chains.shape[1] - 1)),
-                compute_values=compute_values,
-            )
-            logprob_steps.append(
-                dreamzero_action_get_logprob_norm(
-                    chains_next,
-                    x_t_mean,
-                    x_t_std,
-                    safe_get_logprob=bool(
-                        getattr(self.config, "safe_get_logprob", False)
+        with self._dreamzero_ppo_deterministic_context():
+            for idx in range(num_steps):
+                denoise_ind = denoise_inds[:, idx]
+                chains_pre = chains[batch_indices, denoise_ind]
+                chains_next = chains[batch_indices, denoise_ind + 1]
+                x_t_mean, x_t_std, value_t, _ = self.dreamzero_action_sample_mean_var_val(
+                    x_t=chains_pre,
+                    idx=denoise_ind,
+                    action_obs=action_obs,
+                    sample_method=str(getattr(self.config, "noise_method", "flow_sde")),
+                    denoise_steps=int(
+                        getattr(self.config, "num_steps", chains.shape[1] - 1)
                     ),
-                    mask=action_mask,
+                    compute_values=compute_values,
+                    use_velocity_only=use_velocity_only,
                 )
-            )
-            entropy_steps.append(
-                dreamzero_action_gaussian_entropy(x_t_std, mask=action_mask)
-            )
-            value_steps.append(value_t)
+                logprob_steps.append(
+                    dreamzero_action_get_logprob_norm(
+                        chains_next,
+                        x_t_mean,
+                        x_t_std,
+                        safe_get_logprob=bool(
+                            getattr(self.config, "safe_get_logprob", False)
+                        ),
+                        mask=action_mask,
+                    )
+                )
+                entropy_steps.append(
+                    dreamzero_action_gaussian_entropy(x_t_std, mask=action_mask)
+                )
+                value_steps.append(value_t)
 
         per_dim_logprob = torch.stack(logprob_steps, dim=1)
         per_dim_entropy = torch.stack(entropy_steps, dim=1)
@@ -298,13 +387,17 @@ class DreamZeroPPOPolicyMixin(DreamZeroActionOnlyMixin):
         if bool(getattr(self.config, "joint_logprob", False)):
             logprobs = per_dim_logprob.reshape(bsize, num_steps, -1).mean(dim=1)
             entropy = per_dim_entropy.reshape(bsize, num_steps, -1).mean(dim=1)
+            logprobs = logprobs.reshape_as(chains[:, -1])
+            entropy = entropy.reshape_as(chains[:, -1])
             return (
-                logprobs.reshape_as(chains[:, -1]),
+                self._select_policy_action_dims(logprobs, action_mask),
                 values,
-                entropy.reshape_as(chains[:, -1]),
+                self._select_policy_action_dims(entropy, action_mask),
             )
+        logprobs = per_dim_logprob[:, 0].reshape_as(chains[:, -1])
+        entropy = per_dim_entropy[:, 0].reshape_as(chains[:, -1])
         return (
-            per_dim_logprob[:, 0].reshape_as(chains[:, -1]),
+            self._select_policy_action_dims(logprobs, action_mask),
             values,
-            per_dim_entropy[:, 0].reshape_as(chains[:, -1]),
+            self._select_policy_action_dims(entropy, action_mask),
         )

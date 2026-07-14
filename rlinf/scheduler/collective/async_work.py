@@ -114,24 +114,28 @@ class AsyncFuncWork(AsyncWork):
     def __call__(self, future: Future):
         """Execute the function and set the done flag."""
         start = time.perf_counter()
-        if self._pass_self:
-            self._result = self._func(self, *self._args, **self._kwargs)
-        else:
-            self._result = self._func(*self._args, **self._kwargs)
-        self._exec_time = time.perf_counter() - start
-        if (
-            Worker.current_worker.has_accelerator
-            and Worker.torch_platform.is_initialized()
-        ):
-            self._cuda_event = Worker.torch_platform.Event()
-            self._cuda_event.record()
-        if isinstance(self._result, AsyncWork):
-            # If the result is another AsyncWork, find the last work in the chain
-            # Set the flag only after all works are done
-            last_work_in_chain = self._result.get_last_work()
-            last_work_in_chain.then(self._done.set_result, True)
-        else:
-            self._done.set_result(True)
+        try:
+            if self._pass_self:
+                self._result = self._func(self, *self._args, **self._kwargs)
+            else:
+                self._result = self._func(*self._args, **self._kwargs)
+            self._exec_time = time.perf_counter() - start
+            if (
+                Worker.current_worker.has_accelerator
+                and Worker.torch_platform.is_initialized()
+            ):
+                self._cuda_event = Worker.torch_platform.Event()
+                self._cuda_event.record()
+            if isinstance(self._result, AsyncWork):
+                # If the result is another AsyncWork, find the last work in the chain
+                # Set the flag only after all works are done
+                last_work_in_chain = self._result.get_last_work()
+                last_work_in_chain.then(self._done.set_result, True)
+            else:
+                self._done.set_result(True)
+        except Exception as exc:
+            self._exec_time = time.perf_counter() - start
+            self._done.set_exception(exc)
 
     def then(self, func: Callable, *args, **kwargs) -> "AsyncFuncWork":
         """Set a callback function to be called when the work is completed.
@@ -299,7 +303,13 @@ class AsyncChannelWork(AsyncWork):
     def _execute(self):
         method = getattr(self._channel_actor, self._method)
         future: ConcurrentFuture = method.remote(*self._args, **self._kwargs).future()
-        future.add_done_callback(lambda f: self._future.set_result(f.result()))
+        future.add_done_callback(self._complete_future)
+
+    def _complete_future(self, future: ConcurrentFuture):
+        try:
+            self._future.set_result(future.result())
+        except Exception as exc:
+            self._future.set_exception(exc)
 
     async def async_wait(self):
         """Async wait for the work to complete.
@@ -366,7 +376,11 @@ class AsyncChannelCommWork(AsyncWork):
 
     def _store_channel_data(self):
         """Store channel data in the channel data store."""
-        data, query_id = self._async_comm_work.wait()
+        try:
+            data, query_id = self._async_comm_work.wait()
+        except Exception as exc:
+            self._data_future.set_exception(exc)
+            raise
         with AsyncChannelCommWork.store_lock:
             if query_id not in AsyncChannelCommWork.channel_data_store:
                 AsyncChannelCommWork.channel_data_store[query_id] = Future()

@@ -79,6 +79,7 @@ class DreamZeroConfig(VLAConfig):
     safe_get_logprob: bool = False
     joint_logprob: bool = False
     num_steps: int = 10
+    ppo_use_velocity_only: bool = False
     ppo_deterministic_eval: bool = True
 
     def __init__(self, **kwargs):
@@ -360,9 +361,21 @@ class DreamZeroPolicy(DreamZeroPPOPolicyMixin, VLA, BasePolicy):
         action_obs: dict[str, Any],
         x_t: torch.Tensor,
         timestep: torch.Tensor,
+        *,
+        use_velocity_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         action_head = getattr(self, "action_head", None)
-        if action_head is not None and hasattr(action_head, "predict_action_velocity_only"):
+        if (
+            use_velocity_only
+            and action_head is not None
+            and hasattr(action_head, "predict_action_velocity_only")
+        ):
+            self._dreamzero_ppo_velocity_only_calls = (
+                getattr(self, "_dreamzero_ppo_velocity_only_calls", 0) + 1
+            )
+            action_obs = self._action_obs_to_device(action_obs)
+            x_t = x_t.to(device=next(self.parameters()).device, dtype=torch.float32)
+            timestep = timestep.to(device=x_t.device, dtype=torch.float32)
             output = action_head.predict_action_velocity_only(action_obs, x_t, timestep)
             if isinstance(output, dict):
                 velocity = output["velocity"]
@@ -370,6 +383,16 @@ class DreamZeroPolicy(DreamZeroPPOPolicyMixin, VLA, BasePolicy):
                 return velocity.float(), value_feature.float()
             return output.float(), output.float().mean(dim=1)
 
+        if use_velocity_only:
+            self._dreamzero_ppo_velocity_fallback_calls = (
+                getattr(self, "_dreamzero_ppo_velocity_fallback_calls", 0) + 1
+            )
+            if not getattr(self, "_dreamzero_ppo_velocity_fallback_warned", False):
+                get_logger().warning(
+                    "DreamZero PPO velocity-only requested, but action_head has no "
+                    "predict_action_velocity_only; falling back to lazy_joint_video_action_causal."
+                )
+                self._dreamzero_ppo_velocity_fallback_warned = True
         self._reset_action_chain_inference_state()
         obs = dict(action_obs)
         obs["action"] = x_t.to(

@@ -33,5 +33,9 @@ class DreamZeroActionOnlyMixin:
         action_obs: dict[str, Any],
         x_t: torch.Tensor,
         timestep: torch.Tensor,
+        *,
+        use_velocity_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._predict_action_velocity(action_obs, x_t, timestep)
+        return self._predict_action_velocity(
+            action_obs, x_t, timestep, use_velocity_only=use_velocity_only
+        )

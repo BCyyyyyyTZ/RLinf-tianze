@@ -114,9 +114,8 @@ class DreamZeroLiberoObservationTransform(_LiberoBaseTransform):
         for idx, frame in enumerate(frames):
             histories[idx].append(frame.copy())
             frames_to_use = list(histories[idx])
-            if len(frames_to_use) > 1:
-                while len(frames_to_use) < self.num_history_frames:
-                    frames_to_use.insert(0, frames_to_use[0])
+            while len(frames_to_use) < self.num_history_frames:
+                frames_to_use.insert(0, frames_to_use[0])
             stacked.append(np.stack(frames_to_use, axis=0))
         return np.stack(stacked, axis=0)
 

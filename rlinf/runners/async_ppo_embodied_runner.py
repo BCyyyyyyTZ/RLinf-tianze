@@ -111,6 +111,8 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.actor.set_global_step(self.global_step).wait()
         self.rollout.set_global_step(self.global_step).wait()
         self.env.set_global_step(self.global_step).wait()
+        self.rollout.set_max_steps(self.max_steps).wait()
+        self.env.set_max_steps(self.max_steps).wait()
         self.update_rollout_weights()
 
         env_handle: Handle = self.env.interact(
@@ -147,11 +149,12 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
                     training_metrics = actor_training_handle.wait()
 
                 self.global_step += 1
-                self.actor.set_global_step(self.global_step).wait()
-                self.rollout.set_global_step(self.global_step).wait()
-                self.env.set_global_step(self.global_step).wait()
-                with self.timer("update_rollout_weights"):
-                    self.update_rollout_weights()
+                if self.global_step < self.max_steps:
+                    self.actor.set_global_step(self.global_step).wait()
+                    self.rollout.set_global_step(self.global_step).wait()
+                    self.env.set_global_step(self.global_step).wait()
+                    with self.timer("update_rollout_weights"):
+                        self.update_rollout_weights()
 
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}

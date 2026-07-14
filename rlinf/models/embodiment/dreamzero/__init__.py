@@ -156,6 +156,26 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         f"{_wan_policy_head}.WANPolicyHead._run_diffusion_steps",
         "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only._run_diffusion_steps",
     )
+    Patcher.add_patch(
+        f"{_wan_policy_head}.WANPolicyHead._normalize_action_videos",
+        "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only._normalize_action_videos",
+    )
+    Patcher.add_patch(
+        f"{_wan_policy_head}.WANPolicyHead._prepare_action_velocity_context",
+        "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only._prepare_action_velocity_context",
+    )
+    Patcher.add_patch(
+        f"{_wan_policy_head}.WANPolicyHead._ppo_timestep_to_wan_timestep",
+        "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only._ppo_timestep_to_wan_timestep",
+    )
+    Patcher.add_patch(
+        f"{_wan_policy_head}.WANPolicyHead._run_action_velocity_step",
+        "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only._run_action_velocity_step",
+    )
+    Patcher.add_patch(
+        f"{_wan_policy_head}.WANPolicyHead.predict_action_velocity_only",
+        "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only.predict_action_velocity_only",
+    )
     Patcher.add_wrapper(
         f"{_wan_policy_head}.WANPolicyHead.lazy_joint_video_action",
         lazy_joint_video_action,
@@ -204,6 +224,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     dreamzero_config.safe_get_logprob = bool(cfg.get("safe_get_logprob", False))
     dreamzero_config.joint_logprob = bool(cfg.get("joint_logprob", False))
     dreamzero_config.num_steps = int(cfg.get("num_steps", 10))
+    dreamzero_config.ppo_use_velocity_only = bool(
+        cfg.get("ppo_use_velocity_only", False)
+    )
     dreamzero_config.ppo_deterministic_eval = bool(
         cfg.get("ppo_deterministic_eval", True)
     )

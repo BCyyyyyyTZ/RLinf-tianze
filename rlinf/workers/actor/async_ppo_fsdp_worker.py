@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -24,7 +25,15 @@ from rlinf.utils.distributed import all_reduce_dict, masked_normalization
 from rlinf.utils.metric_utils import append_to_dict, compute_rollout_metrics
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.utils.utils import clear_memory, masked_mean, reshape_entropy
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+from rlinf.workers.actor.fsdp_actor_worker import (
+    EmbodiedFSDPActor,
+    align_dreamzero_aux_to_logprobs,
+    align_dreamzero_logprob_pair,
+    build_dreamzero_logprob_probe,
+    dreamzero_ppo_logprob_probe_enabled,
+    get_dreamzero_loss_action_dim,
+    should_log_actor_training_progress,
+)
 
 
 def flatten_rollout_batch_for_train(
@@ -142,10 +151,11 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             )
             proximal_logprobs_list.append(out["logprobs"].cpu())
 
-        proximal_logprobs = torch.cat(proximal_logprobs_list, dim=0).view(
+        flat_proximal_logprobs = torch.cat(proximal_logprobs_list, dim=0)
+        proximal_logprobs = flat_proximal_logprobs.view(
             t_dim,
             b_dim,
-            *self.rollout_batch["prev_logprobs"].shape[2:],
+            *flat_proximal_logprobs.shape[1:],
         )
         self.rollout_batch["proximal_logprobs"] = proximal_logprobs
 
@@ -198,14 +208,32 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
         metrics: dict[str, list] = {}
         update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
+        total_micro_batches = update_epoch * num_global_batches * micro_per_rank
+        sync_every_micro_batch = bool(
+            self.cfg.actor.get("sync_every_micro_batch", False)
+        )
+        self.log_on_first_rank(
+            "async actor training: start "
+            f"rollout_size_per_rank={flattened_rollout_size} "
+            f"global_batch_size={global_batch_size} "
+            f"per_rank_batch_size={per_rank_batch_size} "
+            f"micro_batch_size={micro_batch_size} "
+            f"micro_per_rank={micro_per_rank} "
+            f"update_epoch={update_epoch} "
+            f"global_batches_per_rank={num_global_batches} "
+            f"total_micro_batches_per_rank={total_micro_batches} "
+            f"sync_every_micro_batch={sync_every_micro_batch}"
+        )
+        micro_batch_seen = 0
 
-        for _ in range(update_epoch):
+        for epoch_idx in range(update_epoch):
             global_batch_iter = split_dict_to_chunk(
                 self.rollout_batch,
                 num_global_batches,
             )
 
-            for train_global_batch in global_batch_iter:
+            for global_batch_idx, train_global_batch in enumerate(global_batch_iter):
+                batch_started = time.monotonic()
                 train_global_batch_size = int(
                     train_global_batch["prev_logprobs"].shape[0]
                 )
@@ -220,17 +248,53 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                     micro_per_rank,
                 )
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
 
                 for mb_idx, data in enumerate(micro_batch_iter):
+                    micro_index = micro_batch_seen
+                    micro_batch_seen += 1
+                    log_progress = self._rank == 0 and should_log_actor_training_progress(
+                        micro_index,
+                        total_micro_batches,
+                    )
+                    if log_progress:
+                        self.log_info(
+                            "async actor training: micro-batch start "
+                            f"{micro_index + 1}/{total_micro_batches} "
+                            f"epoch={epoch_idx + 1}/{update_epoch} "
+                            f"global_batch={global_batch_idx + 1}/{num_global_batches} "
+                            f"micro={mb_idx + 1}/{micro_per_rank}"
+                        )
                     data = put_tensor_device(
                         data,
                         f"cuda:{int(os.environ['LOCAL_RANK'])}",
                     )
+                    self._log_memory_probe(
+                        f"async_micro_{micro_index + 1}_after_batch_to_device",
+                        sync=True,
+                    )
+                    if log_progress:
+                        self.log_info(
+                            "async actor training: batch to device done "
+                            f"{micro_index + 1}/{total_micro_batches}"
+                        )
+                    is_last_micro_batch = (mb_idx + 1) == self.gradient_accumulation
                     backward_ctx = self.before_micro_batch(
                         self.model,
-                        is_last_micro_batch=(mb_idx + 1) == self.gradient_accumulation,
+                        is_last_micro_batch=(
+                            is_last_micro_batch or sync_every_micro_batch
+                        ),
                     )
+                    self._log_memory_probe(
+                        f"async_micro_{micro_index + 1}_after_before_micro_batch",
+                        sync=True,
+                    )
+                    if log_progress:
+                        self.log_info(
+                            "async actor training: before_micro_batch done "
+                            f"{micro_index + 1}/{total_micro_batches} "
+                            f"is_last_micro_batch={is_last_micro_batch}"
+                        )
 
                     advantages = data["advantages"]
                     old_logprobs = data["prev_logprobs"]
@@ -268,6 +332,16 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
                     compute_values = self.cfg.algorithm.adv_type == "gae"
 
+                    forward_started = time.monotonic()
+                    self._log_memory_probe(
+                        f"async_micro_{micro_index + 1}_before_forward",
+                        sync=True,
+                    )
+                    if log_progress:
+                        self.log_info(
+                            "async actor training: model forward start "
+                            f"{micro_index + 1}/{total_micro_batches}"
+                        )
                     with self.amp_context:
                         out = self.model(
                             forward_inputs=forward_inputs,
@@ -277,6 +351,25 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                             use_cache=False,
                             **model_kwargs,
                         )
+                    self._log_memory_probe(
+                        f"async_micro_{micro_index + 1}_after_forward",
+                        sync=True,
+                    )
+                    if log_progress:
+                        self.log_info(
+                            "async actor training: model forward done "
+                            f"{micro_index + 1}/{total_micro_batches} "
+                            f"elapsed={time.monotonic() - forward_started:.2f}s"
+                        )
+                    if os.getenv(
+                        "DREAMZERO_ACTOR_SYNC_AFTER_FORWARD", "0"
+                    ).lower() in ("1", "true", "yes", "on"):
+                        torch.cuda.synchronize()
+                        if log_progress:
+                            self.log_info(
+                                "async actor training: cuda sync after forward done "
+                                f"{micro_index + 1}/{total_micro_batches}"
+                            )
 
                     if (
                         SupportedModel(self.cfg.actor.model.model_type)
@@ -284,12 +377,94 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                     ):
                         old_logprobs = out["prev_logprobs"]
 
+                    loss_action_dim = get_dreamzero_loss_action_dim(
+                        self.cfg.actor.model,
+                        self.cfg.algorithm.loss_type,
+                    )
+                    logprobs = out["logprobs"]
+                    if log_progress:
+                        self.log_info(
+                            "async actor training: logprobs ready "
+                            f"{micro_index + 1}/{total_micro_batches} "
+                            f"shape={tuple(logprobs.shape)} "
+                            f"dtype={logprobs.dtype}"
+                        )
+                    if (
+                        SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.DREAMZERO
+                    ):
+                        logprobs, old_logprobs = align_dreamzero_logprob_pair(
+                            logprobs, old_logprobs
+                        )
+                        proximal_logprobs = align_dreamzero_aux_to_logprobs(
+                            proximal_logprobs, logprobs
+                        )
+                        versions = align_dreamzero_aux_to_logprobs(versions, logprobs)
+                        if logprobs.ndim >= 2:
+                            loss_action_dim = int(logprobs.shape[-1])
+                        if log_progress:
+                            old_shape = (
+                                tuple(old_logprobs.shape)
+                                if old_logprobs is not None
+                                else None
+                            )
+                            proximal_shape = (
+                                tuple(proximal_logprobs.shape)
+                                if proximal_logprobs is not None
+                                else None
+                            )
+                            versions_shape = (
+                                tuple(versions.shape) if versions is not None else None
+                            )
+                            self.log_info(
+                                "async actor training: dreamzero tensors aligned "
+                                f"{micro_index + 1}/{total_micro_batches} "
+                                f"logprobs={tuple(logprobs.shape)} "
+                                f"old_logprobs={old_shape} "
+                                f"proximal_logprobs={proximal_shape} "
+                                f"versions={versions_shape} "
+                                f"loss_action_dim={loss_action_dim}"
+                            )
+                    if (
+                        dreamzero_ppo_logprob_probe_enabled()
+                        and SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.DREAMZERO
+                    ):
+                        if log_progress:
+                            self.log_info(
+                                "async actor training: logprob probe gate "
+                                f"{micro_index + 1}/{total_micro_batches}"
+                            )
+                        probe_count = getattr(self, "_dreamzero_logprob_probe_count", 0)
+                        probe_limit = int(
+                            os.getenv("DREAMZERO_PPO_LOGPROB_PROBE_LIMIT", "8")
+                        )
+                        if probe_count < probe_limit:
+                            probe = build_dreamzero_logprob_probe(
+                                logprobs=logprobs,
+                                old_logprobs=old_logprobs,
+                                logprob_type=self.cfg.algorithm.logprob_type,
+                                single_action_dim=loss_action_dim,
+                            )
+                            self.log_info(
+                                "[DreamZero PPO logprob probe] "
+                                f"logprob_type={self.cfg.algorithm.logprob_type} "
+                                f"single_action_dim={loss_action_dim} "
+                                f"stats={probe}"
+                            )
+                            self._dreamzero_logprob_probe_count = probe_count + 1
+                    if log_progress:
+                        self.log_info(
+                            "async actor training: loss kwargs build start "
+                            f"{micro_index + 1}/{total_micro_batches}"
+                        )
+
                     loss_kwargs = {
                         "loss_type": self.cfg.algorithm.loss_type,
                         "logprob_type": self.cfg.algorithm.logprob_type,
                         "reward_type": self.cfg.algorithm.reward_type,
-                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
-                        "logprobs": out["logprobs"],
+                        "single_action_dim": loss_action_dim,
+                        "logprobs": logprobs,
                         "values": out.get("values", None),
                         "old_logprobs": old_logprobs,
                         "advantages": advantages,
@@ -314,9 +489,33 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         "task_type": self.cfg.runner.task_type,
                         "critic_warmup": self.optimizer_steps
                         < self.critic_warmup_steps,
+                        "clip_log_ratio_min": self.cfg.algorithm.get(
+                            "clip_log_ratio_min", None
+                        ),
+                        "clip_log_ratio_max": self.cfg.algorithm.get(
+                            "clip_log_ratio_max", None
+                        ),
                     }
 
+                    if log_progress:
+                        self.log_info(
+                            "async actor training: loss kwargs built "
+                            f"{micro_index + 1}/{total_micro_batches}"
+                        )
+                        self.log_info(
+                            "async actor training: policy loss start "
+                            f"{micro_index + 1}/{total_micro_batches}"
+                        )
                     loss, metrics_data = policy_loss(**loss_kwargs)
+                    self._log_memory_probe(
+                        f"async_micro_{micro_index + 1}_after_policy_loss",
+                        sync=True,
+                    )
+                    if log_progress:
+                        self.log_info(
+                            "async actor training: policy loss done "
+                            f"{micro_index + 1}/{total_micro_batches}"
+                        )
 
                     entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
                     if (
@@ -327,25 +526,90 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         entropy = reshape_entropy(
                             entropy,
                             entropy_type=self.cfg.algorithm.entropy_type,
-                            action_dim=self.cfg.actor.model.get("action_dim", 7),
-                            batch_size=out["logprobs"].shape[0],
+                            action_dim=loss_action_dim,
+                            batch_size=logprobs.shape[0],
                         )
                         entropy_loss = masked_mean(entropy, mask=loss_mask)
                         loss = loss - self.cfg.algorithm.entropy_bonus * entropy_loss
 
                     loss = loss / self.gradient_accumulation
+                    backward_started = time.monotonic()
+                    self._log_memory_probe(
+                        f"async_micro_{micro_index + 1}_before_backward",
+                        sync=True,
+                    )
+                    if log_progress:
+                        self.log_info(
+                            "async actor training: backward start "
+                            f"{micro_index + 1}/{total_micro_batches}"
+                        )
                     with backward_ctx:
                         self.grad_scaler.scale(loss).backward()
+                    self._log_memory_probe(
+                        f"async_micro_{micro_index + 1}_after_backward",
+                        sync=True,
+                    )
+                    if log_progress:
+                        self.log_info(
+                            "async actor training: backward done "
+                            f"{micro_index + 1}/{total_micro_batches} "
+                            f"elapsed={time.monotonic() - backward_started:.2f}s"
+                        )
 
                     metrics_data["actor/entropy_loss"] = float(
                         entropy_loss.detach().item()
                     )
                     metrics_data["actor/total_loss"] = float(loss.detach().item())
                     append_to_dict(metrics, metrics_data)
+                    micro_batch_iter[mb_idx] = None
+                    self._log_memory_probe(
+                        f"async_micro_{micro_index + 1}_before_del_tensors",
+                        sync=True,
+                    )
+                    del data, out, forward_inputs, loss, metrics_data
+                    self._log_memory_probe(
+                        f"async_micro_{micro_index + 1}_after_del_tensors",
+                        sync=True,
+                    )
 
-                torch.cuda.empty_cache()
+                empty_cache_started = time.monotonic()
+                self.torch_platform.empty_cache()
+                self._log_memory_probe(
+                    f"async_global_{global_batch_idx + 1}_after_empty_cache",
+                    sync=True,
+                )
+                self.log_on_first_rank(
+                    "async actor training: empty_cache done "
+                    f"global_batch={global_batch_idx + 1}/{num_global_batches} "
+                    f"elapsed={time.monotonic() - empty_cache_started:.2f}s"
+                )
 
+                self.log_on_first_rank(
+                    "async actor training: global batch done "
+                    f"{global_batch_idx + 1}/{num_global_batches} "
+                    f"epoch={epoch_idx + 1}/{update_epoch} "
+                    f"elapsed={time.monotonic() - batch_started:.2f}s"
+                )
+                optimizer_started = time.monotonic()
+                self._log_memory_probe(
+                    f"async_global_{global_batch_idx + 1}_before_optimizer_step",
+                    sync=True,
+                )
+                self.log_on_first_rank(
+                    "async actor training: optimizer step start "
+                    f"global_batch={global_batch_idx + 1}/{num_global_batches}"
+                )
                 grad_norm, lr_list = self.optimizer_step()
+                self._log_memory_probe(
+                    f"async_global_{global_batch_idx + 1}_after_optimizer_step",
+                    sync=True,
+                )
+                self.log_on_first_rank(
+                    "async actor training: optimizer step done "
+                    f"global_batch={global_batch_idx + 1}/{num_global_batches} "
+                    f"grad_norm={float(grad_norm):.6g} "
+                    f"elapsed={time.monotonic() - optimizer_started:.2f}s"
+                )
                 extra_metrics = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -355,12 +619,14 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 append_to_dict(metrics, extra_metrics)
 
         self.lr_scheduler.step()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         clear_memory()
 
         mean_metric_dict = {k: float(np.mean(v)) for k, v in metrics.items()}
+        self.log_on_first_rank("async actor training: reducing metrics")
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict,
             op=torch.distributed.ReduceOp.AVG,
         )
+        self.log_on_first_rank("async actor training: done")
         return mean_metric_dict

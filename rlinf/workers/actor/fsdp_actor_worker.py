@@ -162,6 +162,119 @@ def dreamzero_actor_memory_probe_enabled() -> bool:
     )
 
 
+def dreamzero_ppo_logprob_probe_enabled() -> bool:
+    return os.getenv("DREAMZERO_PPO_LOGPROB_PROBE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dreamzero_finite_stats(tensor: torch.Tensor) -> dict[str, float | int | tuple[int, ...]]:
+    tensor = tensor.detach().float()
+    finite = torch.isfinite(tensor)
+    stats: dict[str, float | int | tuple[int, ...]] = {
+        "shape": tuple(tensor.shape),
+        "finite": int(finite.sum().item()),
+        "numel": tensor.numel(),
+    }
+    if bool(finite.any()):
+        finite_tensor = tensor[finite]
+        stats.update(
+            {
+                "min": float(finite_tensor.min().item()),
+                "max": float(finite_tensor.max().item()),
+                "mean": float(finite_tensor.mean().item()),
+                "std": float(finite_tensor.std(unbiased=False).item())
+                if finite_tensor.numel() > 1
+                else 0.0,
+            }
+        )
+    return stats
+
+
+def align_dreamzero_logprob_pair(
+    logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if old_logprobs.shape == logprobs.shape:
+        return logprobs, old_logprobs
+
+    if old_logprobs.numel() == logprobs.numel():
+        return logprobs, old_logprobs.reshape_as(logprobs)
+
+    if (
+        old_logprobs.ndim == logprobs.ndim
+        and old_logprobs.shape[:-1] == logprobs.shape[:-1]
+    ):
+        action_dim = min(old_logprobs.shape[-1], logprobs.shape[-1])
+        return logprobs[..., :action_dim], old_logprobs[..., :action_dim]
+
+    return logprobs, old_logprobs
+
+
+def align_dreamzero_aux_to_logprobs(
+    aux_tensor: Optional[torch.Tensor],
+    logprobs: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if aux_tensor is None or aux_tensor.shape == logprobs.shape:
+        return aux_tensor
+
+    if aux_tensor.numel() == logprobs.numel():
+        return aux_tensor.reshape_as(logprobs)
+
+    if (
+        aux_tensor.ndim == logprobs.ndim
+        and aux_tensor.shape[:-1] == logprobs.shape[:-1]
+        and aux_tensor.shape[-1] >= logprobs.shape[-1]
+    ):
+        return aux_tensor[..., : logprobs.shape[-1]]
+
+    return aux_tensor
+
+
+def build_dreamzero_logprob_probe(
+    *,
+    logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    logprob_type: str,
+    single_action_dim: int,
+) -> dict[str, dict[str, float | int | tuple[int, ...]]]:
+    bsz = logprobs.shape[0]
+    aligned_logprobs, aligned_old_logprobs = align_dreamzero_logprob_pair(
+        logprobs, old_logprobs
+    )
+    new = aligned_logprobs.detach().float()
+    old = aligned_old_logprobs.detach().to(device=new.device, dtype=torch.float32)
+    raw_log_ratio = new - old
+    probe = {
+        "new": _dreamzero_finite_stats(new),
+        "old": _dreamzero_finite_stats(old),
+        "raw_log_ratio": _dreamzero_finite_stats(raw_log_ratio),
+    }
+    new_view = new.reshape(bsz, -1, single_action_dim)
+    old_view = old.reshape(bsz, -1, single_action_dim)
+    if logprob_type == "chunk_level":
+        agg_new = new_view.sum(dim=[1, 2])
+        agg_old = old_view.sum(dim=[1, 2])
+    elif logprob_type == "action_level":
+        agg_new = new_view.sum(dim=-1)
+        agg_old = old_view.sum(dim=-1)
+    elif logprob_type == "token_level":
+        agg_new = new_view
+        agg_old = old_view
+    else:
+        agg_new = new
+        agg_old = old
+    agg_log_ratio = agg_new - agg_old
+    probe["agg_log_ratio"] = _dreamzero_finite_stats(agg_log_ratio)
+    clipped = agg_log_ratio.clamp(min=-88.0, max=88.0)
+    ratio = torch.exp(clipped)
+    probe["ratio_exp_clipped_88"] = _dreamzero_finite_stats(ratio)
+    return probe
+
+
 def get_dreamzero_loss_action_dim(model_cfg, loss_type: str) -> int:
     action_dim = model_cfg.get("action_dim", 7)
     model_type = model_cfg.get("model_type")
@@ -170,7 +283,10 @@ def get_dreamzero_loss_action_dim(model_cfg, loss_type: str) -> int:
             "actor_critic",
             "decoupled_actor_critic",
         ):
-            return action_dim
+            return model_cfg.get(
+                "ppo_loss_action_dim",
+                min(action_dim, model_cfg.get("env_action_dim", action_dim)),
+            )
     return action_dim
 
 
@@ -1741,12 +1857,57 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         self.cfg.actor.model,
                         self.cfg.algorithm.loss_type,
                     )
+                    logprobs = output_dict["logprobs"]
+                    if (
+                        SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.DREAMZERO
+                    ):
+                        logprobs, prev_logprobs = align_dreamzero_logprob_pair(
+                            logprobs, prev_logprobs
+                        )
+                        if logprobs.ndim >= 2:
+                            loss_action_dim = int(logprobs.shape[-1])
+                    if (
+                        dreamzero_ppo_logprob_probe_enabled()
+                        and SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.DREAMZERO
+                    ):
+                        probe_count = getattr(self, "_dreamzero_logprob_probe_count", 0)
+                        probe_limit = int(
+                            os.getenv("DREAMZERO_PPO_LOGPROB_PROBE_LIMIT", "8")
+                        )
+                        if probe_count < probe_limit:
+                            probe = build_dreamzero_logprob_probe(
+                                logprobs=logprobs,
+                                old_logprobs=prev_logprobs,
+                                logprob_type=self.cfg.algorithm.logprob_type,
+                                single_action_dim=loss_action_dim,
+                            )
+                            denoise_inds = None
+                            if isinstance(forward_inputs, dict):
+                                denoise_inds = forward_inputs.get("denoise_inds", None)
+                            if torch.is_tensor(denoise_inds):
+                                unique, counts = torch.unique(
+                                    denoise_inds.detach().cpu(), return_counts=True
+                                )
+                                probe["denoise_inds"] = {
+                                    int(k.item()): int(v.item())
+                                    for k, v in zip(unique, counts)
+                                }
+                            self.log_info(
+                                "[DreamZero PPO logprob probe] "
+                                f"micro={micro_index + 1}/{total_micro_batches} "
+                                f"logprob_type={self.cfg.algorithm.logprob_type} "
+                                f"single_action_dim={loss_action_dim} "
+                                f"stats={probe}"
+                            )
+                            self._dreamzero_logprob_probe_count = probe_count + 1
                     kwargs = {
                         "loss_type": self.cfg.algorithm.loss_type,
                         "logprob_type": self.cfg.algorithm.logprob_type,
                         "reward_type": self.cfg.algorithm.reward_type,
                         "single_action_dim": loss_action_dim,
-                        "logprobs": output_dict["logprobs"],
+                        "logprobs": logprobs,
                         "values": output_dict.get("values", None),
                         "old_logprobs": prev_logprobs,
                         "advantages": advantages,
@@ -1762,6 +1923,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "task_type": self.cfg.runner.task_type,
                         "critic_warmup": self.optimizer_steps
                         < self.critic_warmup_steps,
+                        "clip_log_ratio_min": self.cfg.algorithm.get(
+                            "clip_log_ratio_min", None
+                        ),
+                        "clip_log_ratio_max": self.cfg.algorithm.get(
+                            "clip_log_ratio_max", None
+                        ),
                     }
                     loss, metrics_data = policy_loss(**kwargs)
                     self._log_memory_probe(
@@ -1780,8 +1947,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         entropy = reshape_entropy(
                             entropy,
                             entropy_type=self.cfg.algorithm.entropy_type,
-                            action_dim=self.cfg.actor.model.get("action_dim", 7),
-                            batch_size=output_dict["logprobs"].shape[0],
+                            action_dim=loss_action_dim,
+                            batch_size=logprobs.shape[0],
                         )
                         entropy_loss = masked_mean(entropy, mask=loss_mask)
                         loss -= self.cfg.algorithm.entropy_bonus * entropy_loss

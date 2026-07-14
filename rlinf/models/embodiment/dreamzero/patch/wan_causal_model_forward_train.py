@@ -34,6 +34,7 @@ def _forward_train(
     action=None,
     state=None,
     embodiment_id=None,
+    return_video_pred: bool = True,
 ):
     if self.model_type == "i2v":
         assert clip_feature is not None and y is not None
@@ -177,6 +178,9 @@ def _forward_train(
         action_noise_pred = self.action_decoder(action_noise_pred, embodiment_id)
     else:
         action_noise_pred = None
+
+    if not return_video_pred:
+        return None, action_noise_pred
 
     x_video = x[:, :seq_len]
     e_video = e[:, :seq_len]

@@ -24,7 +24,12 @@ class AsyncEnvWorker(EnvWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self._interact_task: asyncio.Task = None
+        self._max_interact_rounds: int | None = None
+        self._completed_interact_rounds = 0
         assert not self.enable_offload, "Offload not supported in AsyncEnvWorker"
+
+    def set_max_steps(self, max_steps: int) -> None:
+        self._max_interact_rounds = int(max_steps)
 
     async def interact(
         self,
@@ -37,6 +42,8 @@ class AsyncEnvWorker(EnvWorker):
         assert self._interact_task is None or self._interact_task.done(), (
             "Previous interact task is still running while a new interact call is made."
         )
+        self.should_stop = False
+        self._completed_interact_rounds = 0
         self._interact_task = asyncio.create_task(
             self._interact(
                 input_channel,
@@ -59,7 +66,12 @@ class AsyncEnvWorker(EnvWorker):
         actor_channel: Channel | None,
         metric_channel: Channel,
     ):
-        while True:
+        while not self.should_stop:
+            if (
+                self._max_interact_rounds is not None
+                and self._completed_interact_rounds >= self._max_interact_rounds
+            ):
+                break
             env_metrics = await self._run_interact_once(
                 input_channel,
                 rollout_channel,
@@ -67,6 +79,7 @@ class AsyncEnvWorker(EnvWorker):
                 actor_channel,
                 cooperative_yield=True,
             )
+            self._completed_interact_rounds += 1
 
             env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
             env_interact_time_metrics = self.pop_execution_times()
@@ -81,5 +94,6 @@ class AsyncEnvWorker(EnvWorker):
             metric_channel.put(metrics, async_op=True)
 
     async def stop(self):
+        self.should_stop = True
         if self._interact_task is not None and not self._interact_task.done():
             self._interact_task.cancel()

@@ -37,6 +37,8 @@ def compute_decoupled_ppo_actor_loss(
     loss_mask_sum: Optional[torch.Tensor] = None,
     critic_warmup: Optional[bool] = False,
     behave_weight_threshold: Optional[float] = None,
+    clip_log_ratio_min: Optional[float] = None,
+    clip_log_ratio_max: Optional[float] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, dict]:
     """Compute actor loss for decoupled PPO with optional proximal policy anchor."""
@@ -90,9 +92,16 @@ def compute_decoupled_ppo_actor_loss(
     )
 
     loss_mask_count = loss_mask.count_nonzero() or 1
-    proximal_ratio = torch.where(
-        loss_mask, torch.exp(logprobs - proximal_logprobs), 0.0
-    )
+    proximal_log_ratio = logprobs - proximal_logprobs
+    behav_log_ratio = proximal_logprobs - old_logprobs
+    if clip_log_ratio_min is not None:
+        proximal_log_ratio = torch.clamp(proximal_log_ratio, min=clip_log_ratio_min)
+        behav_log_ratio = torch.clamp(behav_log_ratio, min=clip_log_ratio_min)
+    if clip_log_ratio_max is not None:
+        proximal_log_ratio = torch.clamp(proximal_log_ratio, max=clip_log_ratio_max)
+        behav_log_ratio = torch.clamp(behav_log_ratio, max=clip_log_ratio_max)
+
+    proximal_ratio = torch.where(loss_mask, torch.exp(proximal_log_ratio), 0.0)
     clipped_proximal_ratio = torch.clamp(
         proximal_ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high
     )
@@ -109,7 +118,7 @@ def compute_decoupled_ppo_actor_loss(
     else:
         dual_clip_mask = torch.zeros_like(pg_loss, dtype=torch.bool)
 
-    behav_weight = torch.exp(proximal_logprobs - old_logprobs)
+    behav_weight = torch.exp(behav_log_ratio)
     behav_mask = (
         (behav_weight <= behave_weight_threshold).logical_and(loss_mask)
         if behave_weight_threshold is not None
@@ -129,11 +138,11 @@ def compute_decoupled_ppo_actor_loss(
             dual_clip_mask.logical_and(loss_mask).count_nonzero() / loss_mask_count
         )
         proximal_approx_kl = (
-            -torch.where(loss_mask, logprobs - proximal_logprobs, 0.0).sum()
+            -torch.where(loss_mask, proximal_log_ratio.detach(), 0.0).sum()
             / loss_mask_count
         )
         behav_approx_kl = (
-            -torch.where(behav_mask, proximal_logprobs - old_logprobs, 0.0).sum()
+            -torch.where(behav_mask, behav_log_ratio.detach(), 0.0).sum()
             / behav_mask_count
         )
         behav_clip_fraction = 1.0 - (behav_mask_count / loss_mask_count)
@@ -368,15 +377,18 @@ def compute_ppo_critic_loss(
         masked_returns = returns
         masked_values = values
 
-    var_returns = torch.var(masked_returns)
-    if torch.isnan(var_returns) or var_returns == 0:
-        explained_variance = torch.tensor(float("nan"), device=returns.device)
+    if masked_returns.numel() == 0:
+        explained_variance = returns.new_tensor(0.0)
     else:
-        var_diff = torch.var(masked_returns - masked_values)
-        if torch.isnan(var_diff):
-            explained_variance = torch.tensor(float("nan"), device=returns.device)
+        var_returns = torch.var(masked_returns, unbiased=False)
+        if not torch.isfinite(var_returns) or var_returns <= 0:
+            explained_variance = returns.new_tensor(0.0)
         else:
-            explained_variance = 1 - var_diff / var_returns
+            var_diff = torch.var(masked_returns - masked_values, unbiased=False)
+            if torch.isfinite(var_diff):
+                explained_variance = 1 - var_diff / var_returns
+            else:
+                explained_variance = returns.new_tensor(0.0)
 
     # Compile metrics for logging
     metrics_data = {

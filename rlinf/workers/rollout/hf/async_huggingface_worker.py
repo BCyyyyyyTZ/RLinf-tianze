@@ -24,6 +24,8 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self._generate_task: asyncio.Task = None
+        self._max_generate_rounds: int | None = None
+        self._completed_generate_rounds = 0
         self.staleness_threshold = cfg.algorithm.get("staleness_threshold", None)
         self.num_envs_per_stage = (
             self.cfg.env.train.total_num_envs
@@ -43,6 +45,9 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
 
+    def set_max_steps(self, max_steps: int) -> None:
+        self._max_generate_rounds = int(max_steps)
+
     async def generate(
         self,
         input_channel: Channel,
@@ -52,6 +57,8 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         assert self._generate_task is None, (
             "generate task is not None but generate function is called."
         )
+        self.should_stop = False
+        self._completed_generate_rounds = 0
         self._generate_task = asyncio.create_task(
             self._generate(input_channel, output_channel, metric_channel)
         )
@@ -66,12 +73,18 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         output_channel: Channel,
         metric_channel: Channel,
     ):
-        while True:
+        while not self.should_stop:
+            if (
+                self._max_generate_rounds is not None
+                and self._completed_generate_rounds >= self._max_generate_rounds
+            ):
+                break
             if self._background_weight_sync_active:
                 await self._poll_background_weight_sync()
             await self.wait_if_stale()
             for _ in range(self.rollout_epoch):
                 await self.generate_one_epoch(input_channel, output_channel)
+            self._completed_generate_rounds += 1
             if self.finished_episodes is not None:
                 self.finished_episodes += self.total_num_train_envs * self.rollout_epoch
             rollout_metrics = self.pop_execution_times()
@@ -103,6 +116,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             await asyncio.sleep(0.01)
 
     def stop(self):
+        self.should_stop = True
         if self._generate_task is not None and not self._generate_task.done():
             self._generate_task.cancel()
 
