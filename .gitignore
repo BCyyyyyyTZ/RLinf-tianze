@@ -12,6 +12,11 @@ build
 docs/build
 dist
 logs/*
+# Keep selected DreamZero LIBERO baseline experiment logs tracked.
+!logs/4gpu/
+!logs/4gpu/**
+!logs/4gpu/**/*.log
+!logs/4gpu/**/*.txt
 outputs/*
 *.so
 .venv
